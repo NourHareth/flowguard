@@ -38,7 +38,7 @@ dl = ["torch>=2.2"]               # comparison only: our models are pure NumPy
 adv = ["adversarial-robustness-toolbox>=1.17"]
 
 [project.urls]
-Repository = "https://github.com/ihebmabroukii/flowguard"
+Repository = "https://github.com/NourHareth/flowguard"
 
 [tool.setuptools.packages.find]
 where = ["src"]

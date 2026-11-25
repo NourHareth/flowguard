@@ -89,7 +89,7 @@ The original design document, with every component explained, is in [`docs/archi
 ## Quick start
 
 ```bash
-git clone https://github.com/ihebmabroukii/flowguard.git
+git clone https://github.com/NourHareth/flowguard.git
 cd flowguard
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
