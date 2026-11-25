@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 from flowguard.config import load_config
 from flowguard.data.split import temporal_split
@@ -51,6 +52,23 @@ def test_classifier_learns_and_speaks_family_names(name):
     assert model.summary()["n_train_rows"] == len(X)
 
 
+def test_early_stopping_watches_the_class_weighted_validation_loss():
+    """Training minimizes a class-balanced loss, so early stopping must watch the same one,
+    with the training class weights applied to the validation flows."""
+    X, y = _separable(0)
+    X_val, y_val = _separable(1)
+    model = build_classifier("mlp", _models_cfg()).fit(X, y, X_val, y_val)
+    counts = {c: (y == c).sum() for c in model.classes_}
+    per_class = {c: min(len(y) / (len(counts) * n), 100) for c, n in counts.items()}
+    w_val = np.array([per_class[c] for c in y_val])
+    codes = model.encoder_.transform(y_val)
+    est = model.estimator
+    # the restored weights are those of the best epoch, so the weighted loss now is its loss
+    assert est.loss(X_val, codes, w_val) == pytest.approx(est.best_loss_, rel=1e-9)
+    assert est.loss(X_val, codes) != pytest.approx(est.best_loss_, rel=1e-6)   # not the unweighted one
+    assert 1 <= est.best_epoch_ <= est.n_epochs_
+
+
 def test_trivial_baselines_through_the_wrapper():
     X, y = _separable(0)
     majority = build_classifier("majority", {}).fit(X, y)
@@ -91,9 +109,15 @@ def test_train_run_end_to_end(project):
     pipe = fp.fit_pipeline(df, load_config("features", project.root))
     fp.save(pipe, project.models / fp.PIPELINE_FILE)
 
+    # The configured learning rates and batch sizes are sized for millions of flows. On 960
+    # synthetic rows the same settings take too few optimizer steps, so use the small-data
+    # settings of _models_cfg (the softmax model otherwise lands right at the 0.9 bar).
     exp = project.root / "configs" / "experiments.yaml"
-    exp.write_text(exp.read_text().replace("batch_size: 4096", "batch_size: 64")
-                                  .replace("batch_size: 2048", "batch_size: 64"))
+    cfg = yaml.safe_load(exp.read_text())
+    small = _models_cfg()
+    for name in ("softmax_regression", "mlp"):
+        cfg["models"][name] = small[name]
+    exp.write_text(yaml.safe_dump(cfg))
 
     results = run(["softmax_regression", "mlp"], use_mlflow=False, paths=project)
     assert results["softmax_regression"]["validation"]["macro_f1"] > 0.9

@@ -60,11 +60,30 @@ def test_curves(ctx):  # noqa: F811
 def test_ablation_without_recleaning(ctx):  # noqa: F811
     from flowguard.eval.ablation import run
 
-    table = run(["full", "no_log1p", "standard_scaler", "no_class_weights"], ["softmax_regression"], ctx.paths)
-    assert list(table["variant"]) == ["full", "no_log1p", "standard_scaler", "no_class_weights"]
-    assert table.loc[table["variant"] == "full", "delta_vs_full"].iloc[0] == 0
+    variants = ["full", "standard_scaler", "standard_scaler_no_log1p", "no_class_weights"]
+    table = run(variants, ["softmax_regression"], ctx.paths).set_index("variant")
+    assert list(table.index) == variants
+    assert table.loc["full", "delta"] == 0
+    # log1p is measured against the z-score variant, not against full
+    assert table.loc["standard_scaler_no_log1p", "compared_to"] == "standard_scaler"
+    assert table.loc["standard_scaler_no_log1p", "delta"] == pytest.approx(
+        table.loc["standard_scaler_no_log1p", "macro_f1"] - table.loc["standard_scaler", "macro_f1"])
+    assert table["same_test_set"].all() and table["n_test_rows"].nunique() == 1
     assert (table["test_seen_in_train"] == 0).all()        # synthetic flows are all distinct
     assert (table["macro_f1_low"] <= table["macro_f1"]).all()
+
+
+def test_ablation_rejects_an_unknown_baseline(ctx):  # noqa: F811
+    import yaml
+
+    from flowguard.eval.ablation import run
+
+    path = ctx.paths.root / "configs" / "experiments.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    cfg["ablation"]["variants"]["standard_scaler_no_log1p"]["compare_to"] = "nothing"
+    path.write_text(yaml.safe_dump(cfg))
+    with pytest.raises(KeyError, match="compare_to"):
+        run(["standard_scaler_no_log1p"], ["softmax_regression"], ctx.paths)
 
 
 def test_ablation_helpers(features_cfg):
@@ -113,19 +132,23 @@ def test_report_includes_the_analysis_figures(ctx):  # noqa: F811
     from flowguard.eval import ablation, adaptation, calibration, curves, drift
     from flowguard.eval.protocols import run_p1, run_p2, run_p3
     from flowguard.eval.report import build_report
+    from flowguard.models import tune
 
+    tune.run(["softmax_regression"], n_trials=2, paths=ctx.paths)
     run_p1(ctx)
     run_p2(ctx)
     run_p3(ctx)
     calibration.run(["softmax_regression"], ctx.paths)
     curves.run(["softmax_regression"], paths=ctx.paths)
-    ablation.run(["full", "no_log1p"], ["softmax_regression"], ctx.paths)
+    ablation.run(["full", "standard_scaler"], ["softmax_regression"], ctx.paths)
     drift.run(ctx.paths)
     adaptation.run(["softmax_regression", "hybrid"], ctx.paths)
-    out = build_report(ctx.paths)
+    build_report(ctx.paths)
+    out = build_report(ctx.paths)            # twice: the report must not trip over its own output
     expected = {"loss_curves.png", "learning_curves.png", "reliability.png", "ablation.png",
-                "drift_top_features.png", "p2_adaptation.png"}
+                "drift_top_features.png", "p2_adaptation.png", "tuning.png"}
     assert expected <= set(out["figures"])
+    assert "tuning_summary.md" in out["tables"]
     for name in out["figures"]:
         assert (ctx.paths.figures / name).stat().st_size > 10_000
     assert {"ablation.md", "p1_mcnemar.md", "calibration_summary.md"} <= set(out["tables"])

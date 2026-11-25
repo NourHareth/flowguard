@@ -1,14 +1,13 @@
 """Anomaly detector for unseen attacks: our Isolation Forest, trained on benign flows only.
 
-The alert threshold is the `benign_quantile` of the scores on benign validation flows, so by
-construction about (1 - quantile) of benign traffic is flagged. The hybrid detector tunes it further.
+It has no threshold of its own. The hybrid detector (models/hybrid.py) sets the alert threshold
+theta on benign validation flows, from what is left of the false-alert budget after the
+classifier's threshold tau.
 """
 
 from __future__ import annotations
 
 from typing import Any
-
-import numpy as np
 
 from flowguard.models.scratch import IsolationForest
 
@@ -19,8 +18,3 @@ def make_isolation_forest(cfg: dict[str, Any], seed: int = 42) -> IsolationFores
         max_samples=int(cfg.get("max_samples", 256)),
         random_state=seed,
     )
-
-
-def benign_threshold(scores_on_benign: Any, quantile: float = 0.99) -> float:
-    """Score above which a flow is called anomalous."""
-    return float(np.quantile(np.asarray(scores_on_benign, dtype=float), quantile))

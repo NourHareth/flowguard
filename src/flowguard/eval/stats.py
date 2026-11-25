@@ -7,6 +7,12 @@ Bootstrap confidence intervals (Efron and Tibshirani, 1993)
     a multinomial with the observed cell frequencies. That gives an exact row bootstrap in
     microseconds instead of re-scoring millions of rows a thousand times.
 
+    With per-flow weights (P2 undoes the 2018 sampling, see data.load.prevalence_weights) the
+    cells are split further by weight value: (true, predicted, weight). The weights take a handful
+    of distinct values (two for P2), so the multinomial over those finer cells is still exactly
+    the row bootstrap, and the weighted confusion matrix of a resample is its counts times the
+    weight values.
+
     Caveat, stated in the report: the bootstrap treats flows as independent. Flows of one attack
     session are correlated, so the true uncertainty is somewhat larger than these intervals.
 
@@ -31,21 +37,27 @@ import numpy as np
 from flowguard.data.schema import BENIGN
 
 EXACT_LIMIT = 50
+MAX_WEIGHT_LEVELS = 64  # distinct weight values the exact weighted bootstrap accepts
 
 
 # --------------------------------------------------------------------------- confusion counts
 
-def confusion_counts(y_true: Any, y_pred: Any) -> tuple[np.ndarray, np.ndarray]:
-    """(counts, categories): counts[i, j] = flows with true categories[i] predicted categories[j]."""
+def _cells(y_true: Any, y_pred: Any) -> tuple[np.ndarray, np.ndarray]:
+    """(cell index true * k + predicted for every flow, categories)."""
     t = np.asarray(y_true, dtype=object).astype(str)
     p = np.asarray(y_pred, dtype=object).astype(str)
     if len(t) != len(p):
         raise ValueError("y_true and y_pred have different lengths")
     cats, inverse = np.unique(np.concatenate([t, p]), return_inverse=True)
     k = len(cats)
-    ti, pi = inverse[: len(t)], inverse[len(t):]
-    counts = np.bincount(ti * k + pi, minlength=k * k).reshape(k, k)
-    return counts, cats.astype(object)
+    return inverse[: len(t)] * k + inverse[len(t):], cats.astype(object)
+
+
+def confusion_counts(y_true: Any, y_pred: Any) -> tuple[np.ndarray, np.ndarray]:
+    """(counts, categories): counts[i, j] = flows with true categories[i] predicted categories[j]."""
+    cell, cats = _cells(y_true, y_pred)
+    k = len(cats)
+    return np.bincount(cell, minlength=k * k).reshape(k, k), cats
 
 
 def _macro_f1(counts: np.ndarray, label_idx: np.ndarray) -> np.ndarray:
@@ -103,13 +115,30 @@ def bootstrap_ci(
     n_boot: int = 1000,
     alpha: float = 0.05,
     seed: int = 0,
+    sample_weight: Any = None,
 ) -> dict[str, Any]:
     """Percentile bootstrap intervals for macro-F1, benign false alerts per 10k and detection rate.
 
     `labels` fixes the families macro-F1 averages over (default: those present in y_true), so
-    every resample is scored on the same classes as the point estimate.
+    every resample is scored on the same classes as the point estimate. `sample_weight` gives
+    each flow a weight (see the module docstring); the flows themselves are still resampled.
     """
-    counts, cats = confusion_counts(y_true, y_pred)
+    cell, cats = _cells(y_true, y_pred)
+    k = len(cats)
+    if sample_weight is None:
+        levels, level = np.ones(1), np.zeros(len(cell), dtype=np.int64)
+    else:
+        weights = np.asarray(sample_weight, dtype=np.float64)
+        if len(weights) != len(cell):
+            raise ValueError("sample_weight and y_true have different lengths")
+        levels, level = np.unique(weights, return_inverse=True)
+        if len(levels) > MAX_WEIGHT_LEVELS:
+            raise ValueError(f"sample_weight has {len(levels)} distinct values; at most {MAX_WEIGHT_LEVELS} "
+                             "are supported by the exact multinomial bootstrap")
+    # by_level[l, i, j] = flows of weight levels[l] in confusion cell (i, j)
+    by_level = np.bincount(level * k * k + cell, minlength=len(levels) * k * k).reshape(len(levels), k, k)
+    counts = np.tensordot(levels, by_level, axes=1)
+
     if labels is None:
         labels = sorted(set(np.asarray(y_true, dtype=object).astype(str)))
     labels = [str(lab) for lab in labels]
@@ -118,15 +147,16 @@ def bootstrap_ci(
     if len(label_idx) == 0:
         raise ValueError("None of `labels` occurs in y_true or y_pred")
 
-    n = int(counts.sum())
+    n = len(cell)
     rng = np.random.default_rng(seed)
-    flat = counts.ravel()
-    samples = rng.multinomial(n, flat / n, size=n_boot).reshape(n_boot, *counts.shape)
+    draws = rng.multinomial(n, by_level.ravel() / n, size=n_boot).reshape(n_boot, *by_level.shape)
+    samples = np.tensordot(draws, levels, axes=([1], [0]))  # (n_boot, k, k) weighted counts
 
     return {
         "method": "percentile bootstrap over flows (multinomial on confusion cells)",
         "n_boot": int(n_boot),
         "confidence": 1 - alpha,
+        "prevalence_weighted": sample_weight is not None,
         "macro_f1": _interval(float(_macro_f1(counts, label_idx)), _macro_f1(samples, label_idx), alpha),
         "benign_fpr_per_10k": _interval(float(_benign_fpr_per_10k(counts, cats)),
                                         _benign_fpr_per_10k(samples, cats), alpha),
@@ -169,7 +199,7 @@ def mcnemar(y_true: Any, pred_a: Any, pred_b: Any, binary: bool = False) -> dict
     if n <= EXACT_LIMIT:
         method, statistic, p = "exact binomial", float(min(b, c)), _binomial_two_sided(min(b, c), n)
     else:
-        statistic = (abs(b - c) - 1) ** 2 / n
+        statistic = max(0, abs(b - c) - 1) ** 2 / n  # the correction never pushes |b - c| below 0
         method, p = "chi-squared, continuity corrected", math.erfc(math.sqrt(statistic / 2))
     return {"a_right_b_wrong": b, "a_wrong_b_right": c, "statistic": float(statistic),
             "p_value": float(p), "method": method,

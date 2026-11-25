@@ -16,6 +16,7 @@ The last da is the gradient with respect to the input, which the adversarial lab
 from __future__ import annotations
 
 from collections.abc import Sequence
+from itertools import pairwise
 from typing import Any
 
 import numpy as np
@@ -38,7 +39,7 @@ class MLPClassifier(GradientClassifier):
         sizes = [n_features, *self.hidden, n_classes]
         # He initialization: keeps the variance of ReLU activations stable from layer to layer.
         self.weights_ = [rng.normal(0.0, np.sqrt(2.0 / fan_in), size=(fan_in, fan_out))
-                         for fan_in, fan_out in zip(sizes[:-1], sizes[1:])]
+                         for fan_in, fan_out in pairwise(sizes)]
         self.biases_ = [np.zeros(fan_out) for fan_out in sizes[1:]]
 
     def _params(self) -> list[np.ndarray]:

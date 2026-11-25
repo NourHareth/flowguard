@@ -275,4 +275,8 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Run main() from the importable module, not from __main__, so hybrid.joblib refers to
+    # flowguard.models.hybrid.HybridDetector and `python -m flowguard.eval.protocols` can load it.
+    from flowguard.models import hybrid
+
+    hybrid.main()

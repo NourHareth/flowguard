@@ -68,6 +68,40 @@ def test_evasion_rate_counts_only_caught_attacks():
     assert evasion_rate(y, clean, adv) == {"evasion_rate": 0.5, "n_caught": 2}
 
 
+def test_integer_weights_equal_repeated_flows():
+    """Weight 3 on a flow must score exactly like that flow appearing three times."""
+    rng = np.random.default_rng(0)
+    fams = np.array(["Benign", "DoS", "PortScan"], dtype=object)
+    y = rng.choice(fams, 400, p=[0.7, 0.2, 0.1])
+    pred = np.where(rng.random(400) < 0.8, y, rng.choice(fams, 400))
+    score = rng.random(400) + (y != "Benign")
+    w = rng.integers(1, 4, 400)
+    rep = np.repeat(np.arange(400), w)
+    weighted = classification_metrics(y, pred, sample_weight=w)
+    repeated = classification_metrics(y[rep], pred[rep])
+    for key in ("macro_f1", "weighted_f1", "benign_fpr_per_10k", "detection_rate", "accuracy"):
+        assert weighted[key] == pytest.approx(repeated[key]), key
+    assert weighted["per_class"]["DoS"]["support"] == int((y == "DoS").sum())   # flows, not weight
+    assert weighted["prevalence_weighted"] and not repeated["prevalence_weighted"]
+    assert attack_pr_auc(y, score, sample_weight=w) == pytest.approx(attack_pr_auc(y[rep], score[rep]))
+
+
+def test_prevalence_weights_undo_the_loading_sample(project):
+    import json
+
+    from flowguard.data.load import inclusion_probability, prevalence_weights, sampling_fractions
+
+    labels = ["BENIGN", " benign ", "DoS Hulk", "DoS Hulk - Attempted", None]
+    # "Attempted" flows become Benign later but were sampled at the attack rate.
+    assert inclusion_probability(labels, 0.05, 0.5).tolist() == [0.05, 0.05, 0.5, 0.5, 0.5]
+    assert sampling_fractions("cse-cic-ids2018", project) == (0.05, 0.5)       # from the config
+    project.tables.mkdir(parents=True)
+    (project.tables / "load_cse-cic-ids2018.json").write_text(
+        json.dumps({"benign_fraction": 0.1, "attack_fraction": 1.0}))
+    assert sampling_fractions("cse-cic-ids2018", project) == (0.1, 1.0)        # what loading used
+    assert prevalence_weights(["BENIGN", "DDoS"], "cse-cic-ids2018", project).tolist() == [10.0, 1.0]
+
+
 def test_flatten_and_throughput():
     flat = flatten({"macro_f1": 0.9, "per_class": {"DoS": {"recall": 1.0}}, "bad": float("nan")}, "val.")
     assert flat == {"val.macro_f1": 0.9, "val.per_class.DoS.recall": 1.0}

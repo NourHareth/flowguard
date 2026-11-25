@@ -119,7 +119,9 @@ def test_class_weights_raise_minority_recall():
     w = np.where(y == 1, 950 / 50, 1.0)
     plain = SoftmaxRegression(epochs=40, batch_size=100).fit(X, y)
     weighted = SoftmaxRegression(epochs=40, batch_size=100).fit(X, y, sample_weight=w)
-    recall = lambda m: (m.predict(X)[y == 1] == 1).mean()
+    def recall(m):
+        return (m.predict(X)[y == 1] == 1).mean()
+
     assert recall(weighted) > recall(plain) + 0.3
 
 
@@ -149,14 +151,15 @@ def test_mlp_input_gradient_check():
     X, y = rng.normal(size=(4, 5)), rng.integers(0, 3, 4)
     analytic = model.input_gradient(X, y)
     eps = 1e-6
+    def flow_loss(x, label):
+        return -log_softmax(model._logits(x[None, :]))[0, label]
+
     for i in range(len(X)):
-        def flow_loss(x):
-            return -log_softmax(model._logits(x[None, :]))[0, y[i]]
         for j in range(X.shape[1]):
             up, down = X[i].copy(), X[i].copy()
             up[j] += eps
             down[j] -= eps
-            numeric = (flow_loss(up) - flow_loss(down)) / (2 * eps)
+            numeric = (flow_loss(up, y[i]) - flow_loss(down, y[i])) / (2 * eps)
             assert analytic[i, j] == pytest.approx(numeric, rel=1e-4, abs=1e-8)
 
 
@@ -185,6 +188,22 @@ def test_early_stopping_restores_best_epoch():
     best = min(r["val_loss"] for r in model.history_)
     assert model.loss(X_val, y_val) == pytest.approx(best, rel=1e-9)
     assert model.n_epochs_ < 100
+    assert model.history_[model.best_epoch_ - 1]["val_loss"] == pytest.approx(best, rel=1e-9)
+
+
+def test_kept_epoch_is_the_restored_one_not_the_lowest_loss():
+    """An epoch must beat the best by more than `tol` to be kept, so the restored epoch can
+    differ from the one with the lowest loss; the loss curve marks the restored one."""
+    from flowguard.eval.curves import loss_curve
+
+    X, y = blobs(n_per_class=40)
+    X_val, y_val = blobs(n_per_class=40, seed=5)
+    model = MLPClassifier(hidden=(16,), dropout=0.0, lr=0.01, epochs=30, batch_size=16, patience=30,
+                          tol=10.0).fit(X, y, eval_set=[(X_val, y_val)])
+    assert model.best_epoch_ == 1                              # nothing beats epoch 1 by 10 nats
+    curve = loss_curve(model)
+    assert [r["epoch"] for r in curve if r["kept"]] == [1]
+    assert min(curve, key=lambda r: r["val_loss"])["epoch"] != 1
 
 
 def test_get_params_lists_constructor_arguments():

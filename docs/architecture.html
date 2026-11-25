@@ -108,6 +108,22 @@ footer{color:var(--muted);font-size:.88rem;border-top:1px solid var(--line);padd
 </header>
 
 <section>
+  <span class="eyebrow">Plan vs. what was built</span>
+  <h2>Read this first</h2>
+  <p>This page is the project plan, written before the code. The <a href="../README.md">README</a> describes what was actually built. Where they differ:</p>
+  <ul>
+    <li><b>Models.</b> Softmax regression, the MLP and the Isolation Forest are written from scratch in NumPy (<code>models/scratch/</code>), not PyTorch. scikit-learn and XGBoost are benchmarks only. LightGBM and the autoencoder were not used.</li>
+    <li><b>Columns.</b> The corrected DistriNet releases of both datasets share one 91-column header, so no column map is needed. After dropping identifiers, 82 features remain.</li>
+    <li><b>Feature pipeline.</b> Signed log1p, median imputation, constant-feature removal, correlation filter (|r| &gt; 0.98), then quantile scaling, in that order.</li>
+    <li><b>P2.</b> It scores the P1 models (trained on the P1 training split, not all of 2017). 2018 is sampled at 5% of benign and 50% of attack flows, and every P2 metric is weighted back to the real class balance.</li>
+    <li><b>P3.</b> The feature pipeline is refitted without the held-out family, as well as the classifier.</li>
+    <li><b>Hybrid thresholds.</b> τ and θ come from a shared false-alert budget on benign validation flows, after temperature scaling, not from the 99th percentile of anomaly scores.</li>
+    <li><b>Online part.</b> A CICFlowMeter CSV can be scored with the saved pipeline and hybrid (<code>python -m flowguard.serve.score</code>); each flow gets its decision and reason.</li>
+    <li><b>Not built yet.</b> P4 (adversarial lab), SHAP explanations, the pcap flow extractor, the API and the dashboard.</li>
+  </ul>
+</section>
+
+<section>
   <span class="eyebrow">The questions the project answers</span>
   <h2>Four research questions</h2>
   <p>Every experiment exists to answer one of these. Put them in your introduction and answer them in your conclusion.</p>

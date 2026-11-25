@@ -83,6 +83,41 @@ def test_bootstrap_is_seeded_and_labels_are_fixed():
         bootstrap_ci(y, pred, labels=["Nothing"])
 
 
+def test_weighted_bootstrap_point_estimates_match_weighted_metrics():
+    from flowguard.eval.metrics import classification_metrics
+
+    y, pred = _predictions(error=0.2)
+    w = np.where(y == "Benign", 20.0, 2.0)                 # P2's prevalence weights
+    ci = bootstrap_ci(y, pred, n_boot=200, sample_weight=w)
+    m = classification_metrics(y, pred, labels=list(FAMILIES), sample_weight=w)
+    assert ci["prevalence_weighted"]
+    assert ci["macro_f1"]["estimate"] == pytest.approx(m["macro_f1"])
+    assert ci["benign_fpr_per_10k"]["estimate"] == pytest.approx(m["benign_fpr_per_10k"])
+    assert ci["detection_rate"]["estimate"] == pytest.approx(m["detection_rate"])
+    # unit weights change nothing, draws included
+    assert bootstrap_ci(y, pred, seed=4, sample_weight=np.ones(len(y)))["macro_f1"] == \
+        bootstrap_ci(y, pred, seed=4)["macro_f1"]
+    with pytest.raises(ValueError):
+        bootstrap_ci(y, pred, sample_weight=np.arange(len(y), dtype=float))   # too many levels
+    with pytest.raises(ValueError):
+        bootstrap_ci(y, pred, sample_weight=w[:-1])
+
+
+def test_weighted_multinomial_bootstrap_matches_weighted_row_bootstrap():
+    from flowguard.eval.metrics import classification_metrics
+
+    y, pred = _predictions(n=1500, error=0.25, seed=3)
+    w = np.where(y == "Benign", 20.0, 2.0)
+    fast = bootstrap_ci(y, pred, n_boot=1500, seed=1, sample_weight=w)["macro_f1"]
+    rng = np.random.default_rng(2)
+    slow = []
+    for _ in range(1500):
+        idx = rng.integers(0, len(y), len(y))
+        slow.append(classification_metrics(y[idx], pred[idx], labels=list(FAMILIES), sample_weight=w[idx])["macro_f1"])
+    assert fast["std"] == pytest.approx(np.std(slow, ddof=1), rel=0.12)
+    assert fast["low"] == pytest.approx(np.quantile(slow, 0.025), abs=0.01)
+
+
 def test_macro_f1_batch_shape():
     counts = np.array([[[5, 1], [0, 4]], [[3, 3], [3, 1]]])
     out = _macro_f1(counts, np.array([0, 1]))
@@ -112,6 +147,11 @@ def test_mcnemar_chi_squared_and_symmetry():
     assert r["statistic"] == pytest.approx(stat)
     assert r["p_value"] == pytest.approx(math.erfc(math.sqrt(stat / 2)))
     assert mcnemar(y, b, a)["p_value"] == pytest.approx(r["p_value"])
+    # b == c: the continuity correction must not turn a zero difference into a positive statistic
+    tie_a, tie_b = y.copy(), y.copy()
+    tie_a[:30], tie_b[30:60] = "DoS", "DoS"
+    tie = mcnemar(y, tie_a, tie_b)
+    assert tie["method"].startswith("chi-squared") and tie["statistic"] == 0 and tie["p_value"] == 1.0
 
 
 def test_mcnemar_binary_ignores_wrong_family():

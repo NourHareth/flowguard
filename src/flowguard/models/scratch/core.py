@@ -95,7 +95,14 @@ class GradientClassifier:
         return {n: getattr(self, n) for n in dict.fromkeys(names) if hasattr(self, n)}
 
     def fit(self, X: Any, y: Any, sample_weight: Any = None, eval_set: Any = None,
-            verbose: bool = False) -> GradientClassifier:
+            verbose: bool = False, sample_weight_eval_set: Any = None) -> GradientClassifier:
+        """Train with Adam; with `eval_set`, stop early on the validation loss.
+
+        `sample_weight_eval_set` (same name and shape as in XGBoost: one weight array per eval
+        set) weights the validation loss. FlowClassifier passes the training class weights, so
+        early stopping watches the same class-balanced loss that training minimizes, not one
+        dominated by benign flows.
+        """
         X = np.asarray(X)
         y = np.asarray(y, dtype=np.int64)
         n = len(X)
@@ -107,12 +114,15 @@ class GradientClassifier:
         params = self._params()
         optimizer = Adam(params, lr=self.lr)
 
-        X_val = y_val = None
+        X_val = y_val = w_val = None
         if eval_set:
             X_val, y_val = np.asarray(eval_set[0][0]), np.asarray(eval_set[0][1], dtype=np.int64)
+            if sample_weight_eval_set is not None and sample_weight_eval_set[0] is not None:
+                w_val = np.asarray(sample_weight_eval_set[0], dtype=np.float64)
 
         self.history_: list[dict[str, float]] = []
         best, best_params, bad_epochs = np.inf, [p.copy() for p in params], 0
+        self.best_epoch_ = 0
         for epoch in range(1, self.epochs + 1):
             order = rng.permutation(n)
             weighted_loss = weight_seen = 0.0
@@ -126,13 +136,14 @@ class GradientClassifier:
             record = {"epoch": epoch, "train_loss": weighted_loss / weight_seen}
             monitored = record["train_loss"]
             if X_val is not None:
-                record["val_loss"] = self.loss(X_val, y_val)
+                record["val_loss"] = self.loss(X_val, y_val, w_val)
                 monitored = record["val_loss"]
             self.history_.append(record)
             if verbose:
                 print(record)
             if monitored < best - self.tol:
                 best, best_params, bad_epochs = monitored, [p.copy() for p in params], 0
+                self.best_epoch_ = epoch
             else:
                 bad_epochs += 1
                 if bad_epochs >= self.patience:
@@ -154,11 +165,12 @@ class GradientClassifier:
     def predict(self, X: Any) -> np.ndarray:
         return self.decision_function(X).argmax(axis=1)
 
-    def loss(self, X: Any, y: Any) -> float:
-        """Unweighted mean cross-entropy (no regularization term), in batches."""
+    def loss(self, X: Any, y: Any, sample_weight: Any = None) -> float:
+        """Mean cross-entropy (no regularization term), weighted when `sample_weight` is given."""
         y = np.asarray(y, dtype=np.int64)
         logits = self.decision_function(X)
-        return float(-log_softmax(logits)[np.arange(len(y)), y].mean())
+        per_flow = -log_softmax(logits)[np.arange(len(y)), y]
+        return float(np.average(per_flow, weights=sample_weight))
 
     # subclass hooks -------------------------------------------------------
     def _init_params(self, n_features: int, n_classes: int, rng: np.random.Generator) -> None:

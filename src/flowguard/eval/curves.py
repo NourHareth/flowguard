@@ -39,8 +39,13 @@ def loss_curve(model: Any) -> list[dict[str, Any]]:
     history = getattr(estimator, "history_", None)
     if not history:
         raise ValueError(f"{getattr(model, 'name', model)} has no training history (not one of our gradient models)")
-    monitor = "val_loss" if "val_loss" in history[0] else "train_loss"
-    best_epoch = min(history, key=lambda r: r[monitor])["epoch"]
+    # The epoch early stopping restored. It can differ from the lowest loss: an epoch only counts
+    # as better when it improves by more than `tol`. Models saved before best_epoch_ existed
+    # fall back to the lowest monitored loss.
+    best_epoch = getattr(estimator, "best_epoch_", None)
+    if not best_epoch:
+        monitor = "val_loss" if "val_loss" in history[0] else "train_loss"
+        best_epoch = min(history, key=lambda r: r[monitor])["epoch"]
     return [{**row, "kept": row["epoch"] == best_epoch} for row in history]
 
 
@@ -53,7 +58,7 @@ def learning_curve(name: str, X_train: Any, y_train: Any, X_val: Any, y_val: Any
     y_train = np.asarray(y_train, dtype=object)
     rows = []
     for fraction in sorted(fractions):
-        idx = stratified_cap(y_train, int(round(fraction * len(y_train))), seed=seed)
+        idx = stratified_cap(y_train, round(fraction * len(y_train)), seed=seed)
         X_sub, y_sub = X_train.iloc[idx], y_train[idx]
         start = time.perf_counter()
         cfg = {name: {**(models_cfg.get(name) or {}), "max_train_rows": None}}
@@ -107,8 +112,9 @@ def run(models: list[str] | None = None, learning: bool = True, paths: Any = Non
         y_train, y_val = train[FAMILY].to_numpy(), val[FAMILY].to_numpy()
         fractions = [float(f) for f in ccfg.get("fractions", [0.01, 0.03, 0.1, 0.3, 1.0])]
         models_cfg = tuned_models_cfg(exp_cfg, paths)
+        seed = int(exp_cfg.get("seed", 42))
         rows = [row for name in models for row in
-                learning_curve(name, X_train, y_train, X_val, y_val, models_cfg, fractions, int(exp_cfg.get("seed", 42)))]
+                learning_curve(name, X_train, y_train, X_val, y_val, models_cfg, fractions, seed)]
         pd.DataFrame(rows).to_csv(paths.tables / "learning_curve.csv", index=False)
         out["learning_curve"] = "learning_curve.csv"
     return out

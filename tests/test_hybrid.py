@@ -19,25 +19,10 @@ from flowguard.models.hybrid import (
     threshold_for_fpr,
 )
 from flowguard.models.scratch import IsolationForest, SoftmaxRegression
+from tests.conftest import Encoded
 
 CENTERS = {"Benign": (0, 0, 0, 0), "DoS": (6, 0, 0, 0), "PortScan": (0, 6, 0, 0)}
 UNSEEN = ("Botnet", (0, 0, 9, 9))  # never in training
-
-
-class Encoded:
-    """String labels <-> integers around one of our estimators (NumPy only)."""
-
-    def __init__(self, estimator):
-        self.estimator = estimator
-        self.name = type(estimator).__name__
-
-    def fit(self, X, y, X_val=None, y_val=None):
-        self.classes_, codes = np.unique(np.asarray(y, dtype=object), return_inverse=True)
-        self.estimator.fit(X, codes)
-        return self
-
-    def predict_proba(self, X):
-        return self.estimator.predict_proba(X)
 
 
 def flows(spec, seed=0):
@@ -128,7 +113,9 @@ def test_decide_is_consistent():
 def test_a_stricter_budget_means_fewer_benign_alerts():
     loose, (X_val, y_val) = fitted_hybrid(max_fpr=0.05)
     strict, _ = fitted_hybrid(max_fpr=0.001)
-    rate = lambda h: (h.predict(X_val)[y_val == BENIGN] != BENIGN).mean()
+    def rate(h):
+        return (h.predict(X_val)[y_val == BENIGN] != BENIGN).mean()
+
     assert rate(strict) <= rate(loose)
     assert strict.tau_ >= loose.tau_
 

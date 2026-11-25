@@ -104,6 +104,42 @@ def test_p2_scores_shared_families_and_reports_2018_only_ones(ctx):
     assert rec["metrics"]["unseen_family_detection_rate"] > 0.9
 
 
+def test_p2_is_scored_at_the_real_class_balance(ctx):
+    from flowguard.eval.metrics import classification_metrics
+    from flowguard.eval.protocols import run_p2
+
+    rec = run_p2(ctx, ["softmax_regression"])["softmax_regression"]
+    m = rec["metrics"]
+    assert rec["prevalence_weights"] == [2.0, 20.0]          # 1 / 50% for attacks, 1 / 5% for benign
+    assert m["prevalence_weighted"] and m["ci"]["prevalence_weighted"]
+    assert m["ci"]["macro_f1"]["estimate"] == pytest.approx(m["macro_f1"])
+    assert "macro_f1_unweighted" in m
+    # recompute by hand: benign flows count 20 times, attack flows twice
+    d18 = pd.read_parquet(ctx.paths.processed_file("cse-cic-ids2018"))
+    shared = d18["family"].isin(["Benign", "DoS"]).to_numpy()
+    model = joblib.load(ctx.paths.models / "p1" / "softmax_regression.joblib")
+    pred = model.predict(fp.transform(ctx.pipe, d18))[shared]
+    y = d18["family"].to_numpy()[shared]
+    w = np.where(y == "Benign", 20.0, 2.0)
+    assert m["macro_f1"] == pytest.approx(classification_metrics(y, pred, ["Benign", "DoS"], w)["macro_f1"])
+
+
+def test_p3_refits_the_pipeline_without_the_held_out_family(ctx, monkeypatch):
+    from flowguard.eval import protocols
+
+    seen = []
+    real_fit = protocols.fp.fit_pipeline
+
+    def spy(train, cfg, seed=42):
+        seen.append(set(train["family"]))
+        return real_fit(train, cfg, seed)
+
+    monkeypatch.setattr(protocols.fp, "fit_pipeline", spy)
+    rec = protocols.run_p3(ctx, ["PortScan"])["PortScan"]
+    assert seen == [{"Benign", "DoS", "Botnet"}]                # PortScan never reaches the scaler
+    assert rec["pipeline_refit_without_held_out"] and rec["n_features"] >= 1
+
+
 def test_p3_holds_out_a_family_and_skips_unknown_ones(ctx):
     from flowguard.eval.protocols import run_p3
 

@@ -4,8 +4,15 @@ P1  In-dataset:     models from `make train`, scored on the CIC-IDS2017 P1 test 
 P2  Cross-dataset:  the same models, scored on CSE-CIC-IDS2018 (a different network), on the
                     families both datasets share. Families only 2018 has are reported apart:
                     a model cannot name them, but it can still raise an alert.
-P3  Leave-one-family-out: for each family, retrain the hybrid's classifier without it, rebuild
-                    the hybrid, and check what happens to that family's flows at test time.
+                    2018 is sampled while loading (5% of benign, 50% of attack flows), which
+                    would inflate precision, F1 and PR-AUC tenfold in the attacks' favour. Every
+                    P2 flow is therefore weighted by 1 / its inclusion probability, so the scores
+                    reflect the real class balance (data.load.prevalence_weights). McNemar's test
+                    and the confusion matrices count the sampled flows themselves.
+P3  Leave-one-family-out: for each family, refit the feature pipeline and retrain the hybrid's
+                    classifier without it, rebuild the hybrid, and check what happens to that
+                    family's flows at test time. Nothing fitted in P3, the scaling and feature
+                    selection included, has seen the held-out family.
 
 Every P1/P2 score comes with a 95% bootstrap confidence interval, and every pair of models is
 compared with McNemar's test on the same flows (Holm-adjusted p-values), see eval/stats.py.
@@ -33,7 +40,8 @@ import pandas as pd
 from flowguard import tracking
 from flowguard.config import Paths, load_config
 from flowguard.data.io import SPLIT, load_p1, load_processed
-from flowguard.data.schema import BENIGN, FAMILY
+from flowguard.data.load import prevalence_weights
+from flowguard.data.schema import BENIGN, FAMILY, LABEL_RAW
 from flowguard.data.split import TEST, TRAIN, VAL, leave_family_out
 from flowguard.eval.metrics import (
     attack_pr_auc,
@@ -81,10 +89,6 @@ def load_model(paths: Paths, name: str) -> Any:
     return joblib.load(path)
 
 
-def _rows(X: pd.DataFrame, mask: np.ndarray) -> pd.DataFrame:
-    return X.iloc[np.flatnonzero(mask)]
-
-
 def _save(ctx: Context, stem: str, record: dict[str, Any], confusion: pd.DataFrame | None = None) -> None:
     ctx.paths.tables.mkdir(parents=True, exist_ok=True)
     (ctx.paths.tables / f"{stem}.json").write_text(json.dumps(record, indent=2, default=str))
@@ -97,9 +101,11 @@ def _stats_cfg(ctx: Context) -> dict[str, Any]:
     return {"n_boot": int(s.get("n_boot", 1000)), "alpha": float(s.get("alpha", 0.05))}
 
 
-def _with_ci(ctx: Context, metrics: dict[str, Any], y: np.ndarray, pred: np.ndarray, labels: list[str]) -> None:
+def _with_ci(ctx: Context, metrics: dict[str, Any], y: np.ndarray, pred: np.ndarray, labels: list[str],
+             sample_weight: np.ndarray | None = None) -> None:
     s = _stats_cfg(ctx)
-    metrics["ci"] = bootstrap_ci(y, pred, labels=labels, n_boot=s["n_boot"], alpha=s["alpha"], seed=ctx.seed)
+    metrics["ci"] = bootstrap_ci(y, pred, labels=labels, n_boot=s["n_boot"], alpha=s["alpha"], seed=ctx.seed,
+                                 sample_weight=sample_weight)
 
 
 def _compare(ctx: Context, stem: str, y: np.ndarray, predictions: dict[str, np.ndarray]) -> pd.DataFrame | None:
@@ -159,25 +165,32 @@ def run_p2(ctx: Context, models: list[str] | None = None) -> dict[str, dict]:
     train_families = set(load_processed("cic-ids2017", ctx.paths, columns=[FAMILY])[FAMILY])
     test = load_processed("cse-cic-ids2018", ctx.paths)
     y = test[FAMILY].to_numpy()
+    weights = prevalence_weights(test[LABEL_RAW], "cse-cic-ids2018", ctx.paths)
     shared = sorted(train_families & set(y))
     in_shared = np.isin(y, shared)
     only_2018 = sorted(set(y) - train_families)
     X = fp.transform(ctx.pipe, test)
-    log.info("P2: %d flows, shared families %s, 2018-only %s", len(X), shared, only_2018)
+    log.info("P2: %d flows, shared families %s, 2018-only %s, prevalence weights %s",
+             len(X), shared, only_2018, sorted(set(np.round(weights, 3))))
 
+    ys, ws = y[in_shared], weights[in_shared]
     results, predictions = {}, {}
     for name in models or ctx.cfg["protocols"]["P2_cross_dataset"]:
         model = load_model(ctx.paths, name)
         pred = np.asarray(model.predict(X), dtype=object)
-        predictions[name] = pred[in_shared]
+        ps = pred[in_shared]
+        predictions[name] = ps
         score = model.attack_score(X)
-        metrics = classification_metrics(y[in_shared], pred[in_shared], labels=shared)
-        metrics["pr_auc"] = attack_pr_auc(y[in_shared], score[in_shared])
-        _with_ci(ctx, metrics, y[in_shared], pred[in_shared], shared)
+        metrics = classification_metrics(ys, ps, labels=shared, sample_weight=ws)
+        metrics["macro_f1_unweighted"] = classification_metrics(ys, ps, labels=shared)["macro_f1"]
+        metrics["pr_auc"] = attack_pr_auc(ys, score[in_shared], sample_weight=ws)
+        _with_ci(ctx, metrics, ys, ps, shared, sample_weight=ws)
         if only_2018:
-            metrics["unseen_family_detection_rate"] = detection_rate(y[~in_shared], pred[~in_shared])
+            metrics["unseen_family_detection_rate"] = detection_rate(y[~in_shared], pred[~in_shared],
+                                                                     weights[~in_shared])
         record = {"protocol": "P2", "model": name, "test_rows": int(in_shared.sum()),
-                  "shared_families": shared, "families_only_in_2018": only_2018, "metrics": metrics}
+                  "shared_families": shared, "families_only_in_2018": only_2018,
+                  "prevalence_weights": sorted({float(v) for v in weights}), "metrics": metrics}
         labels = sorted(set(y[in_shared]) | set(pred[in_shared]))
         _save(ctx, f"p2_test_{name}", record, confusion_table(y[in_shared], pred[in_shared], labels))
         _log(ctx, f"P2-test-{name}", {"protocol": "P2", "stage": "test", "model": name}, metrics)
@@ -197,7 +210,8 @@ def run_p3(ctx: Context, families: list[str] | None = None) -> dict[str, dict]:
 
     df = load_p1(ctx.paths)
     split = df[SPLIT]
-    X_all, y_all = fp.transform(ctx.pipe, df), df[FAMILY].to_numpy()
+    y_all = df[FAMILY].to_numpy()
+    features_cfg = load_config("features", ctx.paths.root)
     present = set(y_all)
     p3_cfg = ctx.cfg.get("p3", {})
     requested = list(families or p3_cfg.get("families") or sorted(present - {BENIGN}))
@@ -218,16 +232,20 @@ def run_p3(ctx: Context, families: list[str] | None = None) -> dict[str, dict]:
     results: dict[str, dict] = {}
     for family in families:
         masks = leave_family_out(df, split, family)
-        X_tr, y_tr = _rows(X_all, masks.train), y_all[masks.train]
-        X_val, y_val = _rows(X_all, masks.val), y_all[masks.val]
-        X_te, y_te = _rows(X_all, masks.test), y_all[masks.test]
-        log.info("P3 hold out %-12s train %d, val %d, test %d (held-out flows %d)",
-                 family, len(y_tr), len(y_val), len(y_te), int((y_te == family).sum()))
+        # The saved P1 pipeline was fitted on training data that includes `family`: its quantiles
+        # and its feature selection have seen the "unseen" attack. Refit it without that family.
+        pipe = fp.fit_pipeline(df[masks.train], features_cfg, ctx.seed)
+        X_tr, y_tr = fp.transform(pipe, df[masks.train]), y_all[masks.train]
+        X_val, y_val = fp.transform(pipe, df[masks.val]), y_all[masks.val]
+        X_te, y_te = fp.transform(pipe, df[masks.test]), y_all[masks.test]
+        log.info("P3 hold out %-12s train %d, val %d, test %d (held-out flows %d), %d features",
+                 family, len(y_tr), len(y_val), len(y_te), int((y_te == family).sum()), X_tr.shape[1])
 
         classifier = build_classifier(name, models_cfg, ctx.seed).fit(X_tr, y_tr, X_val, y_val)
         hybrid = build_hybrid(ctx.cfg, classifier, ctx.seed).fit(X_tr, y_tr, X_val, y_val, fit_classifier=False)
 
-        record: dict[str, Any] = {"protocol": "P3", "held_out": family, "classifier": name}
+        record: dict[str, Any] = {"protocol": "P3", "held_out": family, "classifier": name,
+                                  "pipeline_refit_without_held_out": True, "n_features": int(X_tr.shape[1])}
         for label, model in ((name, classifier), ("hybrid", hybrid)):
             pred = np.asarray(model.predict(X_te), dtype=object)
             outcome = unknown_detection(y_te, pred, family)
@@ -274,4 +292,4 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["TRAIN", "VAL", "TEST", "Context", "load_context", "run_p1", "run_p2", "run_p3"]
+__all__ = ["TEST", "TRAIN", "VAL", "Context", "load_context", "run_p1", "run_p2", "run_p3"]

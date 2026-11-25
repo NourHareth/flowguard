@@ -9,11 +9,19 @@ feature pipeline -> train our models -> score the test split.
                       keep_columns takes columns off the drop list, e.g. Dst Port.
     training: {...}   balanced_weights: false turns class weighting off; any other key overrides
                       the model's hyperparameters (e.g. dropout: 0.0)
+    compare_to: name  the variant `delta` is measured against (default: full). The log transform
+                      is measured as standard_scaler_no_log1p vs standard_scaler, because the
+                      quantile transform of the full pipeline only sees the order of values,
+                      which log1p does not change.
 
 The headline row is `no_dedup`: duplicated flows land in both train and test, so the model is
 partly scored on flows it has memorized. Next to the scores, every variant reports the share of
 test flows whose exact feature vector also appears in its training split, which makes the
 leakage visible as a number.
+
+Variants that re-clean the data (no_dedup, with_dst_port) have a different test set than full,
+so their delta mixes the design change with the change of test set. `same_test_set` and
+`n_test_rows` make that visible; for no_dedup it is the point (the duplicates are the leak).
 
 Output: reports/tables/ablation.csv (+ ablation.json)
 
@@ -99,10 +107,12 @@ def run_variant(name: str, spec: dict[str, Any], df: Any, exp_cfg: dict[str, Any
         ci = bootstrap_ci(y_test, pred, labels=labels, n_boot=int(exp_cfg.get("stats", {}).get("n_boot", 1000)),
                           seed=seed)["macro_f1"]
         rows.append({"variant": name, "model": model_name, "description": spec.get("description", ""),
+                     "compared_to": spec.get("compare_to", "full"),
                      "macro_f1": m["macro_f1"], "macro_f1_low": ci["low"], "macro_f1_high": ci["high"],
                      "benign_fpr_per_10k": m["benign_fpr_per_10k"], "detection_rate": m["detection_rate"],
                      "pr_auc": attack_pr_auc(y_test, model.attack_score(X_test)),
-                     "test_seen_in_train": leakage, "n_rows": len(df), "n_features": X_train.shape[1]})
+                     "test_seen_in_train": leakage, "same_test_set": not needs_recleaning(spec),
+                     "n_rows": len(df), "n_test_rows": len(test), "n_features": X_train.shape[1]})
         log.info("ablation %-18s %-18s macro-F1 %.4f [%.4f, %.4f]  test seen in train %.1f%%",
                  name, model_name, m["macro_f1"], ci["low"], ci["high"], 100 * leakage)
     return rows
@@ -126,6 +136,8 @@ def run(variants: list[str] | None = None, models: list[str] | None = None, path
     models = models or acfg.get("models", ["softmax_regression", "mlp"])
     models_cfg = tuned_models_cfg(exp_cfg, paths)
     unknown = [v for v in variants if v not in specs]
+    unknown += [f"{v}.compare_to={(specs[v] or {}).get('compare_to')}" for v in variants
+                if v in specs and (specs[v] or {}).get("compare_to", "full") not in specs]
     if unknown:
         raise KeyError(f"Unknown ablation variants {unknown}. Defined: {list(specs)}")
 
@@ -148,8 +160,10 @@ def run(variants: list[str] | None = None, models: list[str] | None = None, path
         rows += run_variant(name, spec, df, exp_cfg, features_cfg, models, models_cfg)
 
     table = pd.DataFrame(rows)
-    full = table[table["variant"] == "full"].set_index("model")["macro_f1"]
-    table["delta_vs_full"] = table["macro_f1"] - table["model"].map(full)
+    scores = table.set_index(["variant", "model"])["macro_f1"]
+    # macro-F1 minus that of the variant it is compared with (NaN when that one was not run)
+    table["delta"] = [f1 - scores.get((base, model), np.nan)
+                      for f1, base, model in zip(table["macro_f1"], table["compared_to"], table["model"])]
     paths.tables.mkdir(parents=True, exist_ok=True)
     table.to_csv(paths.tables / "ablation.csv", index=False)
     (paths.tables / "ablation.json").write_text(json.dumps(table.to_dict("records"), indent=2, default=str))

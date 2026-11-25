@@ -14,8 +14,9 @@ from flowguard.data.labels import LabelMapper
 
 REPO = Path(__file__).resolve().parents[1]
 
-# Exact header of the improved CIC-IDS2017 / CSE-CIC-IDS2018 CSVs (89 columns).
-HEADER = (
+# Exact header of the improved CIC-IDS2017 / CSE-CIC-IDS2018 CSVs (91 columns), kept as one
+# string so it can be compared with the first line of a CSV.
+HEADER = (  # noqa: SIM905
     "id,Flow ID,Src IP,Src Port,Dst IP,Dst Port,Protocol,Timestamp,Flow Duration,Total Fwd Packet,"
     "Total Bwd packets,Total Length of Fwd Packet,Total Length of Bwd Packet,Fwd Packet Length Max,"
     "Fwd Packet Length Min,Fwd Packet Length Mean,Fwd Packet Length Std,Bwd Packet Length Max,"
@@ -35,8 +36,28 @@ HEADER = (
 ).split(",")
 TEXT = {"Flow ID", "Src IP", "Dst IP", "Timestamp", "Label"}
 NUMERIC = [c for c in HEADER if c not in TEXT]
-# 89 columns minus the 9 dropped in configs/features.yaml.
-N_FEATURES = 80
+# 91 columns minus the 9 dropped in configs/features.yaml.
+N_FEATURES = 82
+assert len(HEADER) == 91 and len(set(HEADER)) == 91
+
+
+class Encoded:
+    """String labels <-> integers around one of our NumPy estimators (no pandas or scikit-learn)."""
+
+    def __init__(self, estimator):
+        self.estimator = estimator
+        self.name = type(estimator).__name__
+
+    def fit(self, X, y, X_val=None, y_val=None):
+        self.classes_, codes = np.unique(np.asarray(y, dtype=object), return_inverse=True)
+        self.estimator.fit(X, codes)
+        return self
+
+    def predict_proba(self, X):
+        return self.estimator.predict_proba(X)
+
+    def predict(self, X):
+        return self.classes_[self.predict_proba(X).argmax(1)]
 
 
 @pytest.fixture

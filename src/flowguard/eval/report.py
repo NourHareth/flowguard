@@ -35,12 +35,13 @@ import pandas as pd
 
 from flowguard.config import Paths
 from flowguard.eval.style import GRID, INK, INK_SECONDARY, REFERENCE, SEQUENTIAL, SERIES, SURFACE
+from flowguard.models import OURS as OUR_CLASSIFIERS
+from flowguard.models import TRIVIAL as TRIVIAL_MODELS
 
 log = logging.getLogger(__name__)
 
-OURS = {"softmax_regression", "mlp", "hybrid"}
-TRIVIAL = {"majority", "random_prior"}
-
+OURS = {*OUR_CLASSIFIERS, "hybrid"}
+TRIVIAL = set(TRIVIAL_MODELS)
 
 
 # --------------------------------------------------------------------------- reading
@@ -49,13 +50,27 @@ def _read(tables: Path, pattern: str) -> list[dict[str, Any]]:
     return [json.loads(p.read_text()) for p in sorted(tables.glob(pattern))]
 
 
+def macro_f1_over(per_class: dict[str, dict[str, Any]], families: list[str]) -> float:
+    """Macro-F1 restricted to `families`: the mean of their per-family F1 (NaN if none is there)."""
+    f1 = [per_class[f]["f1"] for f in families if f in per_class]
+    return float(np.mean(f1)) if f1 else float("nan")
+
+
 def results_table(tables: Path) -> pd.DataFrame:
     rows: dict[str, dict[str, Any]] = {}
+    p1_per_class: dict[str, dict[str, Any]] = {}
+    p2_families: dict[str, list[str]] = {}
     for protocol, pattern in (("p1", "p1_test_*.json"), ("p2", "p2_test_*.json")):
         for rec in _read(tables, pattern):
             m = rec["metrics"]
             row = rows.setdefault(rec["model"], {"model": rec["model"]})
             row[f"{protocol}_macro_f1"] = m["macro_f1"]
+            if protocol == "p1":
+                p1_per_class[rec["model"]] = m["per_class"]
+            else:
+                p2_families[rec["model"]] = rec.get("shared_families") or list(m["per_class"])
+                if "macro_f1_unweighted" in m:
+                    row["p2_macro_f1_unweighted"] = m["macro_f1_unweighted"]
             ci = m.get("ci", {}).get("macro_f1")
             if ci:
                 row[f"{protocol}_macro_f1_low"], row[f"{protocol}_macro_f1_high"] = ci["low"], ci["high"]
@@ -73,7 +88,11 @@ def results_table(tables: Path) -> pd.DataFrame:
     df.insert(1, "written_by", np.select([df["model"].isin(OURS), df["model"].isin(TRIVIAL)],
                                          ["us", "trivial baseline"], "library"))
     if {"p1_macro_f1", "p2_macro_f1"} <= set(df.columns):
-        df["macro_f1_drop"] = df["p1_macro_f1"] - df["p2_macro_f1"]
+        # Compare like with like: P1 macro-F1 over the same families P2 is scored on.
+        df["p1_macro_f1_p2_families"] = [
+            macro_f1_over(p1_per_class[m], p2_families[m]) if m in p1_per_class and m in p2_families
+            else float("nan") for m in df["model"]]
+        df["macro_f1_drop"] = df["p1_macro_f1_p2_families"] - df["p2_macro_f1"]
     order = {"us": 0, "library": 1, "trivial baseline": 2}
     return df.sort_values(["written_by", "model"], key=lambda s: s.map(order) if s.name == "written_by" else s)
 
@@ -225,9 +244,9 @@ def plot_p3(p3: pd.DataFrame, out: Path, plt: Any) -> Path | None:
             vals = d[col].to_numpy(dtype=float)
             ax.barh(families, vals, left=left, color=color, label=label, height=0.62,
                     edgecolor=SURFACE, linewidth=2)
-            for k, (v, l) in enumerate(zip(vals, left)):
+            for k, (v, start) in enumerate(zip(vals, left)):
                 if v >= 0.12:
-                    ax.text(l + v / 2, k, f"{v:.0%}", ha="center", va="center", fontsize=8, color=INK)
+                    ax.text(start + v / 2, k, f"{v:.0%}", ha="center", va="center", fontsize=8, color=INK)
             left += vals
         ax.set_xlim(0, 1)
         ax.xaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
@@ -374,7 +393,8 @@ def plot_reliability(tables: Path, out: Path, plt: Any) -> Path | None:
 
 
 def plot_tuning(tables: Path, out: Path, plt: Any) -> Path | None:
-    files = sorted(tables.glob("tuning_*.csv"))
+    # one tuning_<model>.csv per searched model; tuning_summary.csv is this module's own output
+    files = [p for p in sorted(tables.glob("tuning_*.csv")) if p.stem != "tuning_summary"]
     if not files:
         return None
     fig, axes = _figure(plt, 4.6 * len(files), 3.4, ncols=len(files))

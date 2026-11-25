@@ -1,7 +1,7 @@
 # Feature configuration shared by training (offline) and the detection service (online).
 #
 # Both improved releases (DistriNet, CNS 2022) were generated with the same fixed CICFlowMeter,
-# so CIC-IDS2017 and CSE-CIC-IDS2018 share one header: 89 columns, the last two being
+# so CIC-IDS2017 and CSE-CIC-IDS2018 share one header: 91 columns, the last two being
 # `Label` and `Attempted Category`. No renaming is needed between them.
 
 # Columns read as text. Everything else is coerced to float32.

@@ -2,7 +2,7 @@
 
 # FlowGuard
 
-**A network intrusion detector that is tested on a second network, tested against an attacker,<br/>and says so when it sees something it doesn't know.**
+**A network intrusion detector that is tested on a second network<br/>and says so when it sees something it doesn't know. Testing it against an attacker is next.**
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![Models](https://img.shields.io/badge/our%20models-NumPy%20from%20scratch-013243?logo=numpy&logoColor=white)
@@ -22,7 +22,7 @@ Most intrusion detection results are measured on the same dataset the model was 
 
 - **Does it still work on another network?** We train on CIC-IDS2017 and test on CSE-CIC-IDS2018, a different network captured a year later.
 - **Can it catch an attack it has never seen?** A hybrid of a classifier and an anomaly detector is tested on attack families held out of training.
-- **Can an attacker evade it?** Evasion attacks are limited to what a real attacker controls: their own packets.
+- **Can an attacker evade it?** (Planned, P4.) Evasion attacks are limited to what a real attacker controls: their own packets.
 - **Are the numbers real?** No leakage, confidence intervals and significance tests on every score, and an ablation that measures what each design choice is worth.
 
 > Final-year Machine Learning project, Cyber Security Engineering.
@@ -73,16 +73,18 @@ flowchart LR
     subgraph ON["Online: detection service"]
         T[pcap] -.-> FE[Flow extractor]
         FE -.-> ST[Saved transform]
-        ST -.-> HD[Hybrid detector]
+        CSV[CICFlowMeter CSV] --> ST
+        ST --> HD[Hybrid detector]
+        HD --> SC[Scored CSV<br/>decision + reason]
         HD -.-> UI[API + dashboard]
     end
     F -. same file .-> ST
     H -. deploy .-> HD
     classDef planned stroke-dasharray: 5 5
-    class A,X,T,FE,ST,HD,UI planned
+    class A,X,T,FE,UI planned
 ```
 
-The original design document, with every component explained, is in [`docs/architecture.html`](docs/architecture.html) (download it and open it in a browser).
+The original design document, with every component explained, is in [`docs/architecture.html`](docs/architecture.html) (download it and open it in a browser). It is the plan written before the code; where the two differ, this README describes what was built.
 
 ## Quick start
 
@@ -101,7 +103,7 @@ Then [download the data](#getting-the-data) and run the pipeline:
 make data features tune train eval analyze report
 ```
 
-Python 3.11 or newer. Our models need only NumPy. `[all]` adds the libraries the pipeline needs (pandas, scikit-learn, XGBoost, matplotlib, MLflow), plus serving and dev tools. PyTorch (`[dl]`) and IBM ART (`[adv]`) are optional extras, used only for comparison.
+Python 3.11 or newer. Our models need only NumPy; the pipeline around them needs pandas, scikit-learn, XGBoost and matplotlib, which a plain `pip install -e .` installs. `[all]` adds MLflow experiment tracking (`[track]`, optional: every step runs without it) and the dev tools (`[dev]`: pytest, ruff, JupyterLab). `[test]` is pytest and ruff alone, as used by CI. The extras for the planned parts (`[explain]`, `[serve]`) and the comparison-only PyTorch (`[dl]`) and IBM ART (`[adv]`) are installed separately.
 
 Windows has no `make` by default. Install it (`winget install GnuWin32.Make` or `scoop install make`), or run the `python -m ...` commands listed under each target in the [Makefile](Makefile).
 
@@ -121,6 +123,13 @@ curl -L -C - -o data/raw/cic-ids2017/CICIDS2017_improved.zip https://intrusion-d
 curl -L -C - -o data/raw/cse-cic-ids2018/CSECICIDS2018_improved.zip https://intrusion-detection.distrinet-research.be/CNS2022/Datasets/CSECICIDS2018_improved.zip
 ```
 
+In Windows PowerShell, `curl` is an alias for `Invoke-WebRequest`, which rejects these options. Call `curl.exe` (built into Windows 10 and 11) instead:
+
+```powershell
+curl.exe -L -C - -o data/raw/cic-ids2017/CICIDS2017_improved.zip https://intrusion-detection.distrinet-research.be/CNS2022/Datasets/CICIDS2017_improved.zip
+curl.exe -L -C - -o data/raw/cse-cic-ids2018/CSECICIDS2018_improved.zip https://intrusion-detection.distrinet-research.be/CNS2022/Datasets/CSECICIDS2018_improved.zip
+```
+
 `-C -` resumes an interrupted download. The loader reads the CSVs straight out of the zips, so unzipping is optional. Datasets, trained models and experiment logs are git-ignored and rebuilt with `make`.
 
 ## Running the pipeline
@@ -135,18 +144,29 @@ curl -L -C - -o data/raw/cse-cic-ids2018/CSECICIDS2018_improved.zip https://intr
 | Calibration, curves, drift, adaptation | `make analyze` | `reports/tables/` |
 | Ablation study (retrains, slow) | `make ablate` | `reports/tables/ablation.csv` |
 | Report | `make report` | `reports/tables/*.md` and 10 figures in `reports/figures/` |
-| Experiment browser | `mlflow ui` | <http://127.0.0.1:5000> |
+| Score your own flows | `make score CSV=capture.csv` | `capture_scored.csv`: one decision and its reason per flow |
+| Experiment browser | `mlflow ui` (needs `[track]`) | <http://127.0.0.1:5000> |
 
 Every number in the report is rebuilt from these targets. Notebooks are for looking at things only: any code a reported number depends on lives in `src/flowguard/`.
+
+### Scoring your own traffic
+
+Once the models are trained, any CSV of flows can go through the same saved pipeline and hybrid detector:
+
+1. Capture traffic **in your own isolated lab only** (see [Ethics and lab safety](#ethics-and-lab-safety)), for example an nmap scan and an SSH brute force against your own VM, plus normal browsing.
+2. Turn the pcap into flows with the [corrected CICFlowMeter](https://github.com/GintsEngelen/CICFlowMeter) the improved datasets were made with, so the columns match. Map any column named differently under `rename:` in `configs/features.yaml`.
+3. `python -m flowguard.serve.score capture.csv` writes `capture_scored.csv`. Each flow keeps its time, addresses and ports, next to the prediction (a family, `Unknown` or `Benign`), the reason (`known_attack`, `unknown_anomaly` or `benign`), the classifier's confidence and the anomaly score. `--model xgboost` scores with a single classifier instead of the hybrid.
+
+Your network is not the lab's, which is exactly the effect P2 measures, so treat these results as a demo. The quantitative claims come from P1 to P3.
 
 ## Method
 
 ### Data
 
-- **Loading.** Both improved releases share one 89-column header. The loader streams each day's CSV out of the zip in 500k-row chunks (some 2018 days are over 3 GB) and writes Parquet. CSE-CIC-IDS2018 is sampled while loading (5% of benign flows, 50% of attack flows), because it is only a test set.
+- **Loading.** Both improved releases share one 91-column header. The loader streams each day's CSV out of the zip in 500k-row chunks (some 2018 days are over 3 GB) and writes Parquet. CSE-CIC-IDS2018 is sampled while loading (5% of benign flows, 50% of attack flows), because it is only a test set.
 - **Labels.** Raw labels are mapped to eight families: `Benign, DoS, DDoS, PortScan, BruteForce, WebAttack, Botnet, Infiltration`. The mapping uses ordered rules in [`configs/labels.yaml`](configs/labels.yaml). An unknown label stops the pipeline rather than being guessed. Following the dataset authors, "Attempted" flows (attack traffic with no malicious payload) become Benign, and Heartbleed (a handful of flows) is dropped.
 - **Cleaning.**
-  - We drop every column that identifies the lab rather than the attack: row id, flow ID, IPs, ports and timestamp. That leaves 80 features.
+  - We drop every column that identifies the lab rather than the attack: row id, flow ID, IPs, ports and timestamp. That leaves 82 features.
   - Infinite rates become missing values.
   - Exact duplicate flows are removed **before** splitting, along with any feature vector that appears under two different families.
   - Every step's row count is saved for the report.
@@ -198,10 +218,11 @@ else          ->  benign
 |---|---|---|---|
 | **P1** In-dataset | First 70% of each (day, family) group of CIC-IDS2017 | Last 30% of each group | RQ1 |
 | **P2** Cross-dataset | The same P1 models | CSE-CIC-IDS2018, families present in both datasets | RQ2 |
-| **P3** Leave-one-family-out | P1 training data minus one attack family; the classifier is retrained and the hybrid recalibrated | P1-test benign + every flow of the held-out family | RQ3 |
+| **P3** Leave-one-family-out | P1 training data minus one attack family; the feature pipeline is refitted, the classifier retrained and the hybrid recalibrated, so nothing has seen that family | P1-test benign + every flow of the held-out family | RQ3 |
 | **P4** Adversarial | P1 models, then hardened models | Attack flows perturbed within the threat model | RQ4 |
 
-- **P2 reuses the P1 models**, so the P1 → P2 drop measures only the change of network. 2018 families that 2017 lacks cannot be named by any model. They are left out of macro-F1 and reported separately as a detection rate.
+- **P2 reuses the P1 models**, so the P1 → P2 drop measures the change of network, not a change of model. 2018 families that 2017 lacks cannot be named by any model. They are left out of macro-F1 and reported separately as a detection rate. The drop is computed on the families both protocols score.
+- **P2 is scored at the real class balance.** 2018 is sampled while loading (5% of benign flows, 50% of attack flows), which leaves ten times more attacks per benign flow than the real network had. That would inflate precision, F1 and PR-AUC on its own: a detector with 90% precision at the real balance would show about 99%. Every 2018 flow is therefore weighted by 1 / its sampling rate (benign 20, attacks 2) in every P2 metric and interval. The unweighted macro-F1 is kept next to it. Recall and false alerts per 10,000 benign flows do not depend on the balance either way.
 - **P3** reports where the held-out family ends up: flagged Unknown, alerted under a wrong family, or missed as benign. It does this for the classifier alone and for the hybrid.
 
 **Metrics.**
@@ -221,13 +242,15 @@ We never rank models by accuracy. About 80% of flows are benign, so a detector t
 | **McNemar's test** | Are two models significantly different on the same flows? Exact binomial or continuity-corrected χ², with Holm correction across all pairs. | [`eval/stats.py`](src/flowguard/eval/stats.py) |
 | **Calibration** | Can the probabilities be trusted? Reliability diagrams, ECE, NLL and Brier score, before and after temperature scaling. | [`eval/calibration.py`](src/flowguard/eval/calibration.py) |
 | **Loss and learning curves** | Bias or variance? Loss per epoch, and macro-F1 on growing fractions of the training data. | [`eval/curves.py`](src/flowguard/eval/curves.py) |
-| **Ablations** | What is each design choice worth? One switched off at a time: deduplication, destination port, log transform, quantile scaling, correlation filter, class weights. Each row also reports the share of test flows that appear verbatim in training. | [`eval/ablation.py`](src/flowguard/eval/ablation.py) |
+| **Ablations** | What is each design choice worth? One switched off at a time: deduplication, destination port, quantile scaling, correlation filter, class weights. The log transform is measured with the z-score scaler, because the quantile transform only sees the order of values, which a log does not change. Each row also reports the share of test flows that appear verbatim in training, and whether its test set is the same as the full pipeline's (removing deduplication or keeping the port changes it). | [`eval/ablation.py`](src/flowguard/eval/ablation.py) |
 | **Drift** | *Why* does P2 drop? Per-feature Kolmogorov-Smirnov and PSI between the networks; a domain classifier that tells 2017 from 2018 traffic; and the rank correlation between each family's drift and its recall drop. | [`eval/drift.py`](src/flowguard/eval/drift.py) |
 | **Unsupervised adaptation** | How much of the drop is just scaling? The scaler is re-fitted on the first half of each 2018 day *without labels*, and the unchanged models are scored on the second half. | [`eval/adaptation.py`](src/flowguard/eval/adaptation.py) |
 
 Stated limits:
 - The bootstrap treats flows as independent. Flows of one attack session are correlated, so the true uncertainty is somewhat larger.
-- The 2018 adaptation window over-represents attacks, because of how 2018 is sampled.
+- The 2018 adaptation window over-represents attacks, because of how 2018 is sampled. It is not re-weighted, because the weights come from labels and the adaptation must not use any. Its scores are weighted like P2.
+- Duplicates are removed before splitting, so "false alerts per 10,000 benign flows" counts distinct flows. On raw traffic, repeated benign patterns (DNS lookups, keep-alives) count many times, and the rate per raw flow can differ.
+- Early stopping, the temperature, the thresholds and the random search all use the same validation split, so validation scores are slightly optimistic. Test data plays no part in any of them.
 
 ### Threat model (P4, planned)
 
@@ -271,14 +294,15 @@ The pipeline has not been run on the full datasets yet. `make eval analyze repor
 | Hybrid detector with temperature scaling | Done | Passing |
 | Statistics: bootstrap intervals, McNemar, Holm | Done | Passing |
 | Calibration, random search, drift statistics | Done | Passing |
-| Data loading, cleaning, labels, temporal split | Done | Written, first full run pending |
-| Feature pipeline, benchmarks, training | Done | Written, first full run pending |
-| Protocols P1 to P3, report, curves, ablation, adaptation | Done | Written, first full run pending |
+| Data loading, cleaning, labels, temporal split | Done | Passing |
+| Feature pipeline, benchmarks, training | Done | Passing |
+| Protocols P1 to P3, report, curves, ablation, adaptation | Done | Passing |
+| Scoring a CICFlowMeter CSV with the trained detector | Done | Passing |
 | P4 adversarial lab | Planned | |
 | SHAP explanations | Planned | |
-| Detection API and dashboard | Planned | |
+| pcap flow extractor, detection API and dashboard | Planned | |
 
-All tests run on synthetic flows that use the real 89-column header, so `pytest` needs no dataset. "Passing" means the test file passes. "Written, first full run pending" means the tests exist but have not yet been run in an environment with the full dependency set.
+All tests run on synthetic flows that use the real 91-column header, so `pytest` needs no dataset. "Passing" means the test file passes; the XGBoost benchmark's test is skipped when XGBoost is not installed. CI ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) runs the linter and every test on Python 3.11 to 3.13 with the newest dependencies. The planned parts have `make` targets that stop with a message until they are built.
 
 ## Repository layout
 
@@ -301,7 +325,8 @@ flowguard/
 │   │                        ablation, drift, adaptation, report
 │   ├── adversarial/         P4 (planned)
 │   ├── explain/             SHAP (planned)
-│   └── serve/               flow extractor and API (planned)
+│   └── serve/               score.py: a flow CSV through the trained detector;
+│                            flow extractor and API (planned)
 ├── tests/                   pytest suite on synthetic flows
 ├── docs/architecture.html   design document
 ├── data/  models/  reports/ generated, git-ignored except reports
@@ -317,7 +342,7 @@ flowguard/
 
 ## Author
 
-**Iheb Mabrouki**, Cyber Security Engineering ([@ihebmabroukii](https://github.com/ihebmabroukii))
+**NourHareth**, Cyber Security Engineering
 
 ## License
 

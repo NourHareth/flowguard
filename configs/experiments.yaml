@@ -119,7 +119,9 @@ curves:
 calibration:
   models: [softmax_regression, mlp, xgboost]
 
-# One design choice switched off at a time (eval/ablation.py).
+# One design choice switched off at a time (eval/ablation.py). Each variant is compared with
+# `compare_to` (default: full). no_dedup and with_dst_port re-clean the data, so they are scored
+# on a different test set than full; the table says so in its `same_test_set` column.
 ablation:
   models: [softmax_regression, mlp]
   max_train_rows: 1000000
@@ -132,12 +134,15 @@ ablation:
     with_dst_port:
       description: destination port used as a feature
       features: {keep_columns: [Dst Port]}
-    no_log1p:
-      description: no log transform before scaling
-      features: {log1p: false}
     standard_scaler:
       description: z-score scaling instead of the quantile transform
       features: {scaler: standard}
+    # The quantile transform only looks at the order of values, so log1p before it changes
+    # almost nothing. Its worth is measured where it matters: in front of the z-score scaler.
+    standard_scaler_no_log1p:
+      description: z-score scaling on raw values, no log transform (compare with standard_scaler)
+      features: {scaler: standard, log1p: false}
+      compare_to: standard_scaler
     no_correlation_filter:
       description: highly correlated features kept
       features: {max_correlation: null}

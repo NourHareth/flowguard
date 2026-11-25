@@ -37,7 +37,9 @@ class FlowClassifier:
     - encodes family names to integers (XGBoost needs 0..k-1)
     - optional balanced sample weights, clipped so a 36-flow class can't dominate the loss
     - optional stratified row cap for slow models (logistic regression)
-    - optional validation set for early stopping (XGBoost)
+    - optional validation set for early stopping (XGBoost and our gradient models). With balanced
+      weights, the validation flows get the same per-class weights as training, so early
+      stopping watches the loss that is being minimized (`sample_weight_eval_set`).
     """
 
     def __init__(
@@ -65,21 +67,27 @@ class FlowClassifier:
         X_fit, y_fit = X.iloc[rows], self.encoder_.transform(y[rows])
 
         kwargs: dict[str, Any] = {}
+        class_weight = None
         if self.balanced_weights:
             weights = compute_sample_weight("balanced", y_fit)
             if self.max_class_weight:
                 weights = np.minimum(weights, self.max_class_weight)
             kwargs["sample_weight"] = weights
+            class_weight = np.zeros(len(self.encoder_.classes_))
+            class_weight[y_fit] = weights  # every flow of a class has the same weight
         if self.uses_eval_set and X_val is not None and y_val is not None:
             y_val = np.asarray(y_val, dtype=object)
             known = np.isin(y_val, self.encoder_.classes_)
-            kwargs["eval_set"] = [(X_val[known], self.encoder_.transform(y_val[known]))]
+            codes = self.encoder_.transform(y_val[known])
+            kwargs["eval_set"] = [(X_val[known], codes)]
+            if class_weight is not None:
+                kwargs["sample_weight_eval_set"] = [class_weight[codes]]
             kwargs["verbose"] = False
 
         start = time.perf_counter()
         self.estimator.fit(X_fit, y_fit, **kwargs)
         self.fit_seconds_ = time.perf_counter() - start
-        self.n_train_rows_ = int(len(rows))
+        self.n_train_rows_ = len(rows)
         return self
 
     @property

@@ -3,6 +3,14 @@
 Accuracy is never reported: with ~80% benign flows, a model that always says "benign" scores ~80%.
 Labels are family names (strings); "Benign" is the negative class, everything else is an attack.
 Unknown-anomaly alerts from the hybrid detector use the label UNKNOWN and count as attacks.
+
+`sample_weight` (optional, one weight per flow) is used by P2: CSE-CIC-IDS2018 is sampled while
+loading, and weighting each flow by 1 / its inclusion probability restores the real class balance
+(see data.load.prevalence_weights). Per-class `support` always counts flows, unweighted.
+
+Duplicate flows are removed before splitting (data/clean.py), so "per 10,000 benign flows" means
+per 10,000 distinct benign flows, not per 10,000 flows of raw traffic, where repeated patterns
+(DNS lookups, keep-alives) would count many times.
 """
 
 from __future__ import annotations
@@ -31,31 +39,38 @@ def is_attack(labels: Any) -> np.ndarray:
     return _arr(labels) != BENIGN
 
 
-def benign_fpr_per_10k(y_true: Any, y_pred: Any) -> float:
+def _weights(n: int, sample_weight: Any) -> np.ndarray:
+    return np.ones(n) if sample_weight is None else np.asarray(sample_weight, dtype=np.float64)
+
+
+def benign_fpr_per_10k(y_true: Any, y_pred: Any, sample_weight: Any = None) -> float:
     """Benign flows that raised an alert, per 10,000 benign flows."""
     benign = ~is_attack(y_true)
     if not benign.any():
         return float("nan")
-    return float(is_attack(_arr(y_pred)[benign]).mean() * 10_000)
+    w = _weights(len(benign), sample_weight)[benign]
+    return float(np.average(is_attack(_arr(y_pred)[benign]), weights=w) * 10_000)
 
 
-def detection_rate(y_true: Any, y_pred: Any) -> float:
+def detection_rate(y_true: Any, y_pred: Any, sample_weight: Any = None) -> float:
     """Share of attack flows that raised any alert (right family or not)."""
     attacks = is_attack(y_true)
     if not attacks.any():
         return float("nan")
-    return float(is_attack(_arr(y_pred)[attacks]).mean())
+    w = _weights(len(attacks), sample_weight)[attacks]
+    return float(np.average(is_attack(_arr(y_pred)[attacks]), weights=w))
 
 
-def attack_pr_auc(y_true: Any, attack_score: Any) -> float:
+def attack_pr_auc(y_true: Any, attack_score: Any, sample_weight: Any = None) -> float:
     """Average precision of a continuous attack score (e.g. 1 - P(benign)) for attack vs benign."""
     y = is_attack(y_true).astype(int)
     if y.min() == y.max():
         return float("nan")
-    return float(average_precision_score(y, np.asarray(attack_score, dtype=float)))
+    return float(average_precision_score(y, np.asarray(attack_score, dtype=float), sample_weight=sample_weight))
 
 
-def classification_metrics(y_true: Any, y_pred: Any, labels: Sequence[str] | None = None) -> dict[str, Any]:
+def classification_metrics(y_true: Any, y_pred: Any, labels: Sequence[str] | None = None,
+                           sample_weight: Any = None) -> dict[str, Any]:
     """Macro-F1 over the families present in y_true, per-family precision/recall/F1, and alert rates.
 
     Passing `labels` restricts macro-F1 to those families (P2 scores only the shared ones).
@@ -64,22 +79,27 @@ def classification_metrics(y_true: Any, y_pred: Any, labels: Sequence[str] | Non
     if labels is None:
         labels = sorted(set(y_true))
     labels = list(labels)
-    precision, recall, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, zero_division=0
+    w = None if sample_weight is None else _weights(len(y_true), sample_weight)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels, zero_division=0, sample_weight=w
     )
+    support = [int((y_true == lab).sum()) for lab in labels]  # flows, never weighted
     per_class = {
-        lab: {"precision": float(p), "recall": float(r), "f1": float(f), "support": int(s)}
+        lab: {"precision": float(p), "recall": float(r), "f1": float(f), "support": s}
         for lab, p, r, f, s in zip(labels, precision, recall, f1, support)
     }
     return {
-        "macro_f1": float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0)),
-        "weighted_f1": float(f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0)),
-        "benign_fpr_per_10k": benign_fpr_per_10k(y_true, y_pred),
-        "detection_rate": detection_rate(y_true, y_pred),
+        "macro_f1": float(f1_score(y_true, y_pred, labels=labels, average="macro", zero_division=0,
+                                   sample_weight=w)),
+        "weighted_f1": float(f1_score(y_true, y_pred, labels=labels, average="weighted", zero_division=0,
+                                      sample_weight=w)),
+        "benign_fpr_per_10k": benign_fpr_per_10k(y_true, y_pred, w),
+        "detection_rate": detection_rate(y_true, y_pred, w),
         # Stored only to show, next to the trivial baselines, why it is not used to rank models.
-        "accuracy": float((y_true == y_pred).mean()) if len(y_true) else float("nan"),
+        "accuracy": float(np.average(y_true == y_pred, weights=w)) if len(y_true) else float("nan"),
         "per_class": per_class,
-        "n": int(len(y_true)),
+        "n": len(y_true),
+        "prevalence_weighted": w is not None,  # P2 only, see the module docstring
     }
 
 

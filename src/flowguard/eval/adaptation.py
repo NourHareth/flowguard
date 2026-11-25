@@ -14,9 +14,13 @@ Protocol, to keep adaptation and evaluation apart:
     is by day only, never by family, because family is a label.
     Both the original and the adapted pipeline are scored on the same second half.
 
+Scores are weighted to the real class balance like P2 (data.load.prevalence_weights), and the
+"drop recovered" compares against P1 macro-F1 over the same families as the scored half.
+
 Caveat, stated in the report: the 2018 data is sampled while loading (5% of benign flows, 50% of
 attack flows), so the adaptation window holds more attacks than live traffic would. That shifts
-the fitted quantiles towards attack traffic.
+the fitted quantiles towards attack traffic. The window is deliberately not re-weighted: the
+weights come from labels, and the adaptation must not use any.
 
 Output: reports/tables/p2_adaptation.csv (+ .json)
 
@@ -59,17 +63,19 @@ def refit_statistics(pipe: Any, X_raw: Any, steps: tuple[str, ...] = REFIT_STEPS
     return adapted
 
 
-def evaluate(model: Any, X: Any, y: np.ndarray, shared: list[str]) -> dict[str, Any]:
+def evaluate(model: Any, X: Any, y: np.ndarray, shared: list[str], weights: np.ndarray | None = None) -> dict[str, Any]:
     from flowguard.eval.metrics import attack_pr_auc, classification_metrics, detection_rate
 
     pred = np.asarray(model.predict(X), dtype=object)
     in_shared = np.isin(y, shared)
-    m = classification_metrics(y[in_shared], pred[in_shared], labels=shared)
+    w = np.ones(len(y)) if weights is None else np.asarray(weights, dtype=np.float64)
+    m = classification_metrics(y[in_shared], pred[in_shared], labels=shared, sample_weight=w[in_shared])
     out = {"macro_f1": m["macro_f1"], "benign_fpr_per_10k": m["benign_fpr_per_10k"],
            "detection_rate": m["detection_rate"],
-           "pr_auc": attack_pr_auc(y[in_shared], np.asarray(model.attack_score(X))[in_shared])}
+           "pr_auc": attack_pr_auc(y[in_shared], np.asarray(model.attack_score(X))[in_shared],
+                                   sample_weight=w[in_shared])}
     if (~in_shared).any():
-        out["unseen_family_detection_rate"] = detection_rate(y[~in_shared], pred[~in_shared])
+        out["unseen_family_detection_rate"] = detection_rate(y[~in_shared], pred[~in_shared], w[~in_shared])
     return out
 
 
@@ -77,9 +83,11 @@ def run(models: list[str] | None = None, paths: Any = None) -> Any:
     import pandas as pd
 
     from flowguard.data.io import load_processed
-    from flowguard.data.schema import DAY, FAMILY
+    from flowguard.data.load import prevalence_weights
+    from flowguard.data.schema import DAY, FAMILY, LABEL_RAW
     from flowguard.data.split import TEST, TRAIN, temporal_split
     from flowguard.eval.protocols import load_context, load_model
+    from flowguard.eval.report import macro_f1_over
     from flowguard.models import TRIVIAL
 
     ctx = load_context(paths, use_mlflow=False)
@@ -92,6 +100,7 @@ def run(models: list[str] | None = None, paths: Any = None) -> Any:
     window = temporal_split(tgt, train_fraction=fraction, validation_fraction=0.0, group_cols=(DAY,)).to_numpy()
     adapt, scored = tgt[window == TRAIN], tgt[window == TEST]
     y = scored[FAMILY].to_numpy()
+    weights = prevalence_weights(scored[LABEL_RAW], "cse-cic-ids2018", ctx.paths)
     shared = sorted(train_families & set(y))
     log.info("adaptation window %d flows (no labels used), scored half %d flows", len(adapt), len(scored))
 
@@ -104,7 +113,7 @@ def run(models: list[str] | None = None, paths: Any = None) -> Any:
     for name in models:
         model = load_model(ctx.paths, name)
         for scaling, X in (("2017 statistics", X_original), ("refit on 2018 window", X_adapted)):
-            rows.append({"model": name, "scaling": scaling, **evaluate(model, X, y, shared)})
+            rows.append({"model": name, "scaling": scaling, **evaluate(model, X, y, shared, weights)})
         before, after = rows[-2]["macro_f1"], rows[-1]["macro_f1"]
         log.info("%-18s P2 macro-F1 %.4f -> %.4f (%+.4f)", name, before, after, after - before)
 
@@ -113,9 +122,11 @@ def run(models: list[str] | None = None, paths: Any = None) -> Any:
     for name in models:
         path = ctx.paths.tables / f"p1_test_{name}.json"
         if path.exists():
-            p1[name] = json.loads(path.read_text())["metrics"]["macro_f1"]
+            # Over the families of the scored half only: some 2018 attacks ran entirely in the
+            # first half of their day, and macro-F1 over different family sets is not comparable.
+            p1[name] = macro_f1_over(json.loads(path.read_text())["metrics"]["per_class"], shared)
     if p1:
-        table["p1_macro_f1"] = table["model"].map(p1)
+        table["p1_macro_f1_same_families"] = table["model"].map(p1)
         base = table[table["scaling"] == "2017 statistics"].set_index("model")["macro_f1"]
         drop = table["model"].map(p1) - table["model"].map(base)
         gain = table["macro_f1"] - table["model"].map(base)
@@ -124,8 +135,9 @@ def run(models: list[str] | None = None, paths: Any = None) -> Any:
     ctx.paths.tables.mkdir(parents=True, exist_ok=True)
     table.to_csv(ctx.paths.tables / "p2_adaptation.csv", index=False)
     (ctx.paths.tables / "p2_adaptation.json").write_text(json.dumps(
-        {"adaptation_rows": int(len(adapt)), "scored_rows": int(len(scored)), "shared_families": shared,
-         "refit_steps": list(REFIT_STEPS), "results": table.to_dict("records")}, indent=2, default=str))
+        {"adaptation_rows": len(adapt), "scored_rows": len(scored), "shared_families": shared,
+         "prevalence_weighted": True, "refit_steps": list(REFIT_STEPS), "results": table.to_dict("records")},
+        indent=2, default=str))
     return table
 
 

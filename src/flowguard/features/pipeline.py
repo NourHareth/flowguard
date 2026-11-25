@@ -55,7 +55,8 @@ class CorrelationFilter(TransformerMixin, BaseEstimator):
         self.feature_names_in_ = np.asarray(frame.columns, dtype=object)
         if len(frame) > self.max_rows:
             frame = frame.sample(self.max_rows, random_state=self.random_state)
-        corr = frame.astype("float64").corr().abs().to_numpy()
+        # copy=True: pandas 3 (Copy-on-Write) hands out read-only arrays, and fill_diagonal writes.
+        corr = frame.astype("float64").corr().abs().to_numpy(copy=True)
         np.fill_diagonal(corr, 0.0)
         corr = np.nan_to_num(corr)
         keep: list[int] = []
@@ -164,4 +165,9 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Run main() from the importable module, not from __main__. Otherwise the saved pipeline
+    # refers to __main__.signed_log1p and __main__.CorrelationFilter, and every other command
+    # (`python -m flowguard.models.train`, ...) fails to load it.
+    from flowguard.features import pipeline
+
+    pipeline.main()

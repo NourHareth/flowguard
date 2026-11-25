@@ -26,7 +26,7 @@ SPACE = {
 def test_sample_value_ranges():
     rng = np.random.default_rng(0)
     lrs = [sample_value(SPACE["lr"], rng) for _ in range(2000)]
-    assert 1e-4 <= min(lrs) and max(lrs) <= 1e-1
+    assert min(lrs) >= 1e-4 and max(lrs) <= 1e-1
     # log-uniform: about half the draws fall below the geometric midpoint 10^-2.5
     assert 0.45 < np.mean(np.array(lrs) < 10 ** -2.5) < 0.55
     assert {sample_value(SPACE["layers"], rng) for _ in range(200)} == {1, 2, 3}

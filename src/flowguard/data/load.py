@@ -44,7 +44,8 @@ def iter_csv_sources(raw_dir: Path, stack: ExitStack) -> Iterator[tuple[str, Ope
     csv_files = sorted(raw_dir.rglob("*.csv"))
     if csv_files:
         for path in csv_files:
-            yield path.stem.lower(), (lambda p=path: open(p, "rb"))
+            # An opener, not an open file: the caller opens it in a `with` block.
+            yield path.stem.lower(), (lambda p=path: open(p, "rb"))  # noqa: SIM115
         return
 
     archives = sorted(raw_dir.glob("*.zip"))
@@ -82,15 +83,52 @@ def normalize_chunk(chunk: pd.DataFrame, features_cfg: dict[str, Any]) -> pd.Dat
     return chunk
 
 
+def inclusion_probability(raw_labels: Any, benign_fraction: float, attack_fraction: float) -> np.ndarray:
+    """Probability that `sample_chunk` kept each flow, from its raw label.
+
+    The rule looks at the raw label, not the family: "X - Attempted" flows become Benign during
+    cleaning but were sampled at the attack rate.
+    """
+    labels = pd.Series(np.asarray(raw_labels, dtype=object)).astype("string").str.strip().str.upper()
+    benign = labels.eq("BENIGN").fillna(False).to_numpy(dtype=bool)
+    return np.where(benign, float(benign_fraction), float(attack_fraction))
+
+
 def sample_chunk(
     chunk: pd.DataFrame, benign_fraction: float, attack_fraction: float, rng: np.random.Generator
 ) -> pd.DataFrame:
     """Keep each benign row with probability benign_fraction and each other row with attack_fraction."""
     if benign_fraction >= 1.0 and attack_fraction >= 1.0:
         return chunk
-    benign = chunk[RAW_LABEL].astype("string").str.strip().str.upper().eq("BENIGN").to_numpy()
-    keep_prob = np.where(benign, benign_fraction, attack_fraction)
+    keep_prob = inclusion_probability(chunk[RAW_LABEL], benign_fraction, attack_fraction)
     return chunk[rng.random(len(chunk)) < keep_prob]
+
+
+def sampling_fractions(dataset: str, paths: Paths | None = None) -> tuple[float, float]:
+    """(benign_fraction, attack_fraction) the dataset was loaded with.
+
+    Read from the load summary (what was actually used) and, before the first load, from the
+    config.
+    """
+    paths = paths or Paths.default()
+    summary = paths.tables / f"load_{dataset}.json"
+    if summary.exists():
+        rec = json.loads(summary.read_text())
+        return float(rec["benign_fraction"]), float(rec["attack_fraction"])
+    ds_cfg = load_config("experiments", paths.root)["data"]["datasets"][dataset]
+    return float(ds_cfg.get("benign_fraction", 1.0)), float(ds_cfg.get("attack_fraction", 1.0))
+
+
+def prevalence_weights(raw_labels: Any, dataset: str, paths: Paths | None = None) -> np.ndarray:
+    """Weight of each flow (1 / inclusion probability) that undoes the sampling done while loading.
+
+    CSE-CIC-IDS2018 keeps 5% of benign flows and 50% of attack flows, so unweighted it has 10x
+    more attacks per benign flow than the real network. Precision, F1 and PR-AUC depend on that
+    ratio; weighting each flow by 1 / its inclusion probability scores the real class balance.
+    Recall and false alerts per 10k benign flows are unaffected either way.
+    """
+    benign_fraction, attack_fraction = sampling_fractions(dataset, paths)
+    return 1.0 / inclusion_probability(raw_labels, benign_fraction, attack_fraction)
 
 
 def load_dataset(dataset: str, paths: Paths | None = None, seed: int | None = None) -> dict:

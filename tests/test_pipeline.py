@@ -65,10 +65,15 @@ def test_fitting_uses_only_the_given_rows():
     a, b = _frame(seed=0), _frame(seed=1)
     b["Total Fwd Packet"] += 1000                              # a very different distribution
     b["split"] = "test"                                        # join columns are never features
-    pipe_a = fit_pipeline(a, CFG)
-    pipe_ab = fit_pipeline(pd.concat([a, b]), CFG)
+    # No correlation filter: with it, the two fits may keep different columns, and the
+    # comparison below would be between differently shaped outputs.
+    cfg = {**CFG, "max_correlation": None}
+    pipe_a = fit_pipeline(a, cfg)
+    pipe_ab = fit_pipeline(pd.concat([a, b]), cfg)
     assert "split" not in pipe_ab.feature_names_in_
-    assert not np.allclose(transform(pipe_a, b).to_numpy(), transform(pipe_ab, b).to_numpy())
+    out_a, out_ab = transform(pipe_a, b), transform(pipe_ab, b)
+    assert list(out_a.columns) == list(out_ab.columns)
+    assert not np.allclose(out_a.to_numpy(), out_ab.to_numpy())
 
 
 def test_standard_scaler_option_and_bad_option():

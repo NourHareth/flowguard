@@ -2,7 +2,11 @@
 # On Windows without `make`, run the python commands shown on each line directly.
 PY ?= python
 
-.PHONY: install data features tune train eval analyze ablate attack explain report serve demo test lint clean
+# Targets for parts that are not built yet stop here with a message instead of doing nothing.
+# Replace the $(PLANNED) line with the command in the target's comment once the part exists.
+PLANNED = $(PY) -c "import sys; sys.exit('make $@: not built yet, see Project status in the README')"
+
+.PHONY: install data features tune train eval analyze ablate attack explain report score serve demo test lint clean
 
 install:
 	$(PY) -m pip install -e ".[all]"
@@ -34,22 +38,25 @@ analyze:       ## calibration, loss and learning curves, drift, adaptation (afte
 ablate:        ## ablation study: retrains our models once per variant (slow)
 	$(PY) -m flowguard.eval.ablation
 
-attack:        ## protocol P4: evasion attacks and hardened models
-	$(PY) -m flowguard.adversarial.attacks
+attack:        ## protocol P4 (planned): $(PY) -m flowguard.adversarial.attacks
+	$(PLANNED)
 
-explain:       ## SHAP figures into reports/figures
-	$(PY) -m flowguard.explain.shap_explain
+explain:       ## SHAP figures (planned): $(PY) -m flowguard.explain.shap_explain
+	$(PLANNED)
 
 report:        ## result tables and figures into reports/
 	$(PY) -m flowguard.eval.report
 
-serve:         ## detection API on http://127.0.0.1:8000
-	$(PY) -m uvicorn flowguard.serve.api:app --reload
+score:         ## your own CICFlowMeter CSV through the trained hybrid: make score CSV=capture.csv
+	$(PY) -m flowguard.serve.score $(CSV)
 
-demo:          ## dashboard on http://localhost:8501
-	$(PY) -m streamlit run app/dashboard.py
+serve:         ## detection API (planned): $(PY) -m uvicorn flowguard.serve.api:app --reload
+	$(PLANNED)
 
-test:
+demo:          ## dashboard (planned): $(PY) -m streamlit run app/dashboard.py
+	$(PLANNED)
+
+test:          ## what CI runs (.github/workflows/tests.yml)
 	$(PY) -m pytest
 
 lint:

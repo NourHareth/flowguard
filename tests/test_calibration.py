@@ -21,6 +21,7 @@ from flowguard.models.calibration import (
 from flowguard.models.hybrid import HybridDetector
 from flowguard.models.scratch import IsolationForest, SoftmaxRegression
 from flowguard.models.scratch.core import softmax
+from tests.conftest import Encoded
 
 
 def _calibrated_sample(n=20_000, k=4, seed=0):
@@ -69,22 +70,6 @@ def test_reliability_bins_and_brier():
     assert bins["accuracy"][-1] == pytest.approx(2 / 3)
     assert expected_calibration_error([1.0, 1.0], [1, 1]) == 0.0
     assert brier_score(np.array([[1.0, 0.0], [0.5, 0.5]]), [0, 1]) == pytest.approx(0.25)
-
-
-class Encoded:
-    def __init__(self, estimator):
-        self.estimator = estimator
-
-    def fit(self, X, y, X_val=None, y_val=None):
-        self.classes_, codes = np.unique(np.asarray(y, dtype=object), return_inverse=True)
-        self.estimator.fit(X, codes)
-        return self
-
-    def predict_proba(self, X):
-        return self.estimator.predict_proba(X)
-
-    def predict(self, X):
-        return self.classes_[self.predict_proba(X).argmax(1)]
 
 
 class ProbaOnly:

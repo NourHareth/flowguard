@@ -16,8 +16,13 @@ Three measurements, all from scratch:
    2017 benign flows from 2018 benign flows. ROC-AUC 0.5 = the networks look identical; close to
    1.0 = every flow betrays which network it came from. Its weights rank the telling features.
 
-Both are computed for all flows and per shared family, then lined up against the per-family
-recall drop from P1 to P2: do the families that drift most lose the most recall?
+KS and PSI are computed for all flows and per shared family, and the per-family drift is lined
+up against the per-family recall drop from P1 to P2: do the families that drift most lose the
+most recall? The domain classifier uses benign flows only.
+
+The 2018 side is drawn with the prevalence weights of P2 (data.load.prevalence_weights), so
+"all flows" compares the real traffic mix of both networks, not 2017 against a sample of 2018
+that holds ten times too many attacks per benign flow.
 
 Outputs (reports/tables/): drift_features.csv, drift_by_family.csv, drift_domain_classifier.json,
 drift_vs_recall_drop.csv (when P1 and P2 results exist),
@@ -115,15 +120,22 @@ def spearman(x: Any, y: Any) -> float:
 
 # --------------------------------------------------------------------------- tables
 
-def _sample(df: Any, max_rows: int, seed: int) -> Any:
+def _sample(df: Any, max_rows: int, seed: int, weights: Any = None) -> Any:
+    """At most `max_rows` rows. With `weights`, a weighted draw with replacement, so the rows
+    follow the distribution the weights describe (P2's real class balance)."""
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        if len(w) and not np.allclose(w, w[0]):
+            return df.sample(min(max_rows, len(df)), replace=True, weights=w, random_state=seed)
     return df if len(df) <= max_rows else df.sample(max_rows, random_state=seed)
 
 
-def drift_table(source: Any, target: Any, features: list[str], max_rows: int = MAX_ROWS, seed: int = 0) -> Any:
+def drift_table(source: Any, target: Any, features: list[str], max_rows: int = MAX_ROWS, seed: int = 0,
+                target_weights: Any = None) -> Any:
     """One row per feature: KS D, PSI, and the medians on both networks, sorted by D."""
     import pandas as pd
 
-    s, t = _sample(source, max_rows, seed), _sample(target, max_rows, seed)
+    s, t = _sample(source, max_rows, seed), _sample(target, max_rows, seed, target_weights)
     rows = []
     for f in features:
         a, b = s[f].to_numpy(), t[f].to_numpy()
@@ -133,12 +145,13 @@ def drift_table(source: Any, target: Any, features: list[str], max_rows: int = M
     return pd.DataFrame(rows).sort_values("ks", ascending=False, ignore_index=True)
 
 
-def domain_classifier(source: Any, target: Any, pipe: Any, seed: int = 0, max_rows: int = MAX_ROWS) -> dict[str, Any]:
+def domain_classifier(source: Any, target: Any, pipe: Any, seed: int = 0, max_rows: int = MAX_ROWS,
+                      target_weights: Any = None) -> dict[str, Any]:
     """Train our softmax regression to tell the networks apart; held-out ROC-AUC and top weights."""
     from flowguard.features import pipeline as fp
     from flowguard.models.scratch import SoftmaxRegression
 
-    s, t = _sample(source, max_rows // 2, seed), _sample(target, max_rows // 2, seed)
+    s, t = _sample(source, max_rows // 2, seed), _sample(target, max_rows // 2, seed, target_weights)
     X = np.vstack([fp.transform(pipe, s).to_numpy(), fp.transform(pipe, t).to_numpy()])
     y = np.r_[np.zeros(len(s), dtype=np.int64), np.ones(len(t), dtype=np.int64)]
     names = list(pipe.get_feature_names_out())
@@ -152,7 +165,7 @@ def domain_classifier(source: Any, target: Any, pipe: Any, seed: int = 0, max_ro
     score = model.predict_proba(X[test_idx])[:, 1]
     coef = model.coef_[1] - model.coef_[0]  # log-odds weight towards "2018" (coef_ is classes x features)
     top = np.argsort(-np.abs(coef))[:15]
-    return {"roc_auc": roc_auc(y[test_idx], score), "n_fit": int(cut), "n_test": int(len(test_idx)),
+    return {"roc_auc": roc_auc(y[test_idx], score), "n_fit": int(cut), "n_test": len(test_idx),
             "top_features": [{"feature": names[i], "weight_towards_2018": float(coef[i])} for i in top]}
 
 
@@ -179,7 +192,8 @@ def run(paths: Any = None) -> dict[str, Any]:
 
     from flowguard.config import Paths, load_config
     from flowguard.data.io import SPLIT, load_p1, load_processed
-    from flowguard.data.schema import BENIGN, FAMILY, feature_columns
+    from flowguard.data.load import prevalence_weights
+    from flowguard.data.schema import BENIGN, FAMILY, LABEL_RAW, feature_columns
     from flowguard.data.split import TRAIN
     from flowguard.features import pipeline as fp
 
@@ -190,19 +204,21 @@ def run(paths: Any = None) -> dict[str, Any]:
     src = load_p1(paths)
     src = src[src[SPLIT] == TRAIN]
     tgt = load_processed("cse-cic-ids2018", paths)
+    tgt_w = prevalence_weights(tgt[LABEL_RAW], "cse-cic-ids2018", paths)
     features = [f for f in feature_columns(src) if f in tgt.columns and f != SPLIT]
     shared = sorted(set(src[FAMILY]) & set(tgt[FAMILY]))
 
-    per_feature = [drift_table(src, tgt, features, max_rows, seed).assign(scope="all flows")]
+    per_feature = [drift_table(src, tgt, features, max_rows, seed, tgt_w).assign(scope="all flows")]
     summary = []
     for family in shared:
-        table = drift_table(src[src[FAMILY] == family], tgt[tgt[FAMILY] == family], features, max_rows, seed)
+        in_family = (tgt[FAMILY] == family).to_numpy()
+        table = drift_table(src[src[FAMILY] == family], tgt[in_family], features, max_rows, seed, tgt_w[in_family])
         per_feature.append(table.assign(scope=family))
         summary.append({"family": family, "mean_ks": float(table["ks"].mean()),
                         "median_ks": float(table["ks"].median()),
                         "features_psi_over_0.25": int((table["psi"] > 0.25).sum()),
                         "top_feature": table["feature"].iloc[0], "top_ks": float(table["ks"].iloc[0]),
-                        "rows_2017": int((src[FAMILY] == family).sum()), "rows_2018": int((tgt[FAMILY] == family).sum())})
+                        "rows_2017": int((src[FAMILY] == family).sum()), "rows_2018": int(in_family.sum())})
     features_df = pd.concat(per_feature, ignore_index=True)
     summary_df = pd.DataFrame(summary)
     paths.tables.mkdir(parents=True, exist_ok=True)
@@ -210,7 +226,8 @@ def run(paths: Any = None) -> dict[str, Any]:
     summary_df.to_csv(paths.tables / "drift_by_family.csv", index=False)
 
     pipe = fp.load(paths.models / fp.PIPELINE_FILE)
-    domain = domain_classifier(src[src[FAMILY] == BENIGN], tgt[tgt[FAMILY] == BENIGN], pipe, seed, max_rows)
+    tgt_benign = (tgt[FAMILY] == BENIGN).to_numpy()
+    domain = domain_classifier(src[src[FAMILY] == BENIGN], tgt[tgt_benign], pipe, seed, max_rows, tgt_w[tgt_benign])
     (paths.tables / "drift_domain_classifier.json").write_text(json.dumps(domain, indent=2))
     log.info("domain classifier (2017 vs 2018 benign): ROC-AUC %.4f", domain["roc_auc"])
 
@@ -224,7 +241,7 @@ def run(paths: Any = None) -> dict[str, Any]:
         out["spearman_mean_ks_vs_recall_drop"] = spearman(joined["mean_ks"], joined["recall_drop"])
         log.info("Spearman(mean KS, recall drop) over %d families: %.3f",
                  len(joined), out["spearman_mean_ks_vs_recall_drop"])
-        out["n_families"] = int(len(joined))
+        out["n_families"] = len(joined)
     (paths.tables / "drift_summary.json").write_text(json.dumps(out, indent=2))
     return out
 
